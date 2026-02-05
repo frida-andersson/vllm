@@ -4,9 +4,32 @@
 
 This document outlines a potential optimization for MORI-EP when used in combination with Tensor Parallelism (TP). The optimization eliminates the unnecessary dispatch All-to-All communication when all GPUs already have identical data.
 
-**Status**: Proposed  
+**Status**: Proposed (Recommended Approach)  
 **Author**: Markus Hartikainen (mahartik@amd.com)  
 **Created**: 2026-02-05
+
+---
+
+## Why Dispatch-Free Over Partitioned Dispatch?
+
+Two optimizations were considered for the TP+EP redundant dispatch problem:
+
+| Approach | Dispatch | Combine | Extra Step | Savings | Complexity |
+|----------|----------|---------|------------|---------|------------|
+| Partitioned Dispatch | 1/8 (reduced) | 1/8 | + All-gather | ~81% | Medium |
+| **Dispatch-Free** | **0 (eliminated)** | All-reduce | None | **~100%** | Medium |
+
+**Dispatch-free is the recommended approach because:**
+1. **Better performance**: Eliminates dispatch entirely vs. just reducing it
+2. **Similar complexity**: Both require similar implementation effort
+3. **Simpler model**: No MORI dispatch metadata to manage
+4. **Cleaner design**: All-reduce is a well-understood primitive
+
+```
+Partitioned:   dispatch(1/8) → compute → combine(1/8) → all-gather
+Dispatch-free: filter(local)  → compute → all-reduce
+               ↑ no communication!        ↑ ~same cost as all-gather
+```
 
 ---
 
