@@ -7,11 +7,44 @@ This module provides the MoriPrepareAndFinalize class that uses MORI-EP
 dispatch/combine APIs for All-to-All communication in MoE layers.
 Designed to pair with AiterExperts for maximum AMD performance on MI300X.
 
-MORI-EP supports:
-- EP8, EP16, EP32 configurations
-- FP8 dispatch + BF16 combine (Strategy A)
-- BF16 dispatch + post-dispatch quant (Strategy B)
-- XGMI (intra-node) and RDMA (inter-node)
+Architecture Overview:
+======================
+In Expert Parallelism (EP), experts are distributed across GPUs:
+- EP8 with 256 experts → 32 experts per GPU (experts 0-31 on GPU0, etc.)
+- Tokens must be routed to the GPU that owns the selected expert
+
+The MoE forward pass with MORI-EP:
+1. DISPATCH: Send tokens to GPUs owning selected experts (All-to-All)
+2. COMPUTE:  Each GPU runs AITER kernels on its LOCAL experts only
+3. COMBINE:  Return expert outputs to original token owners (All-to-All)
+
+Data Flow Example (DeepSeek-R1, EP8):
+====================================
+- Input: [batch=128, hidden=7168] tokens on each GPU
+- Router selects topk=8 experts per token (global IDs 0-255)
+- Dispatch routes tokens to expert-owning GPUs
+- Each GPU receives ~128×8/8 = 128 tokens (on average)
+- AITER computes weighted sum of LOCAL expert outputs
+- Combine returns results → [batch=128, hidden=7168] output per GPU
+
+MORI-EP Quantization Strategies:
+================================
+- Strategy A (FP8 dispatch): Quantize before dispatch for 2x bandwidth
+  savings. Use when VLLM_MORI_EP_USE_FP8_DISPATCH=1.
+- Strategy B (BF16 dispatch): Dispatch BF16, quantize after receive.
+  Default mode, simpler but uses more bandwidth.
+
+MORI-EP Configuration:
+======================
+- EP8, EP16, EP32 configurations supported
+- Kernel types: IntraNode (XGMI), InterNode (RDMA)
+- Requires MORI_SHMEM_HEAP_SIZE environment variable for large models
+
+Performance (8× MI300X, XGMI):
+==============================
+- EP8 Dispatch: 307 GB/s, ~35µs latency (128 tokens)
+- EP8 Combine: 330 GB/s, ~47µs latency (128 tokens)
+- Communication ~10-15% overhead at high batch sizes
 
 Reference: https://github.com/ROCm/mori
 """
@@ -79,19 +112,58 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     Expert Parallelism prepare/finalize using MORI dispatch/combine.
     Designed to pair with AiterExperts for maximum AMD performance.
 
-    MORI-EP provides:
+    This class implements the FusedMoEPrepareAndFinalize interface, providing:
+    - prepare_async/prepare: MORI dispatch (send tokens to expert-owning GPUs)
+    - finalize_async/finalize: MORI combine (return results to token owners)
+
+    MORI-EP Architecture:
+    ====================
+    MORI (Multi-GPU Optimized Routing Infrastructure) provides optimized
+    All-to-All primitives for Expert Parallelism on AMD GPUs.
+
+    Key Features:
     - Optimized dispatch/combine kernels for MoE token routing
-    - FP8 dispatch + BF16 combine support
-    - XGMI (intra-node) and RDMA (inter-node) paths
+    - FP8 dispatch + BF16 combine support (Strategy A)
+    - BF16 dispatch + post-receive quantization (Strategy B)
+    - XGMI transport (intra-node, 800 GB/s aggregate)
+    - RDMA transport (inter-node, InfiniBand)
     - EP8, EP16, EP32 configurations
 
-    Quantization Strategies:
-    - Strategy A (FP8 dispatch): Quantize before dispatch for 2x bandwidth savings
-    - Strategy B (BF16 dispatch): Dispatch BF16, quantize after receive
+    Dispatch Phase:
+    ===============
+    1. Router selects topk experts per token (global IDs 0-255)
+    2. Optional: Quantize to FP8 for bandwidth savings (Strategy A)
+    3. MORI dispatch sends each token to GPUs owning its selected experts
+    4. Each GPU receives tokens destined for its LOCAL experts
 
-    Performance (from MORI benchmarks, 8× MI300X):
-    - EP8 Dispatch: 307 GB/s (XGMI), 35µs latency (128 tokens)
-    - EP8 Combine: 330 GB/s (XGMI), 47µs latency (128 tokens)
+    Combine Phase:
+    ==============
+    1. After AITER expert computation produces [N_recv, hidden] outputs
+    2. MORI combine routes results back to original token owners
+    3. Results are summed across all contributing experts
+    4. Output: [batch, hidden] reduced tensor
+
+    Important Implementation Details:
+    =================================
+    - MORI returns FIXED-SIZE buffers; must slice to valid tokens!
+    - Expert IDs: GLOBAL (0-255) → LOCAL (0-31) conversion required
+    - Combine uses ORIGINAL topk_ids (this rank's tokens), NOT received!
+    - DBO (microbatching) support via per-ubatch metadata storage
+
+    Performance (from MORI benchmarks, 8× MI300X, XGMI):
+    ===================================================
+    - EP8 Dispatch: 307 GB/s effective, ~35µs latency (128 tokens)
+    - EP8 Combine: 330 GB/s effective, ~47µs latency (128 tokens)
+    - Communication overhead: ~10-15% at high batch sizes
+
+    Usage:
+    ======
+    Created by oracle/unquantized.py when AITER_MORI_EP backend selected:
+    
+        kernel = FusedMoEModularKernel(
+            MoriPrepareAndFinalize(ep_op, num_local_experts, ...),
+            AiterExperts(quant_config),
+        )
     """
 
     def __init__(
@@ -262,11 +334,39 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         """
         Process dispatch results and prepare for expert computation.
 
-        This handles:
-        1. Unpacking dispatch results
-        2. Expert ID remapping (global → local with -1 handling)
-        3. Post-dispatch quantization (Strategy B)
-        4. ExpertTokensMetadata creation
+        This is the core of the dispatch phase, executing AFTER MORI has
+        completed the All-to-All communication. The function:
+
+        1. Unpacks MORI dispatch results (fixed-size buffers)
+        2. Slices buffers to valid tokens only (CRITICAL for correctness!)
+        3. Converts global expert IDs (0-255) to local IDs (0-31)
+        4. Masks weights for non-local experts to zero
+        5. Applies post-dispatch quantization if using Strategy B
+
+        Args:
+            dispatch_result: Tuple from ep_op.dispatch() containing:
+                [0] recv_x: [max_tokens, hidden] received token embeddings
+                [1] recv_weights: [max_tokens, topk] router weights
+                [2] recv_scale: [max_tokens, scale_dim] FP8 scales (if any)
+                [3] recv_topk_ids: [max_tokens, topk] selected expert IDs
+                [4] total_recv_tokens: GPU scalar with actual valid count
+            has_scales: Whether dispatch included FP8 scales
+            num_experts: Total number of experts globally (e.g., 256)
+            a1_scale: Activation scale for post-dispatch quantization
+            quant_config: Quantization configuration
+
+        Returns:
+            PrepareResultType tuple:
+                (expert_x, expert_x_scale, expert_tokens_meta, 
+                 expert_topk_ids, recv_weights)
+            Ready for AITER expert computation.
+
+        Implementation Notes:
+        ====================
+        - MORI returns FIXED-SIZE buffers [max_tokens, ...], NOT variable!
+        - Only positions 0..total_recv_tokens-1 contain valid data
+        - Using .item() breaks CUDA graph capture (known limitation)
+        - Non-local expert weights set to 0 so they don't contribute
         """
         # Unpack dispatch result
         # Based on mori/python/mori/ops/dispatch_combine.py:
@@ -534,24 +634,52 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         do_async: bool,
     ) -> Callable | None:
         """
-        Internal finalize implementation.
+        Internal finalize implementation - executes MORI combine phase.
 
-        MORI combine handles:
-        - All-to-All communication to return results
-        - Weight application (if not applied on input)
-        - Reduction across topk selections
+        This function completes the MoE layer by:
+        1. Applying weight reduction (if needed) to expert outputs
+        2. Calling MORI combine to route results back to original token owners
+        3. Slicing the fixed-size combine output to actual batch size
+        4. Copying combined results to output buffer
+
+        CRITICAL: Combine uses ORIGINAL topk_ids!
+        =========================================
+        The topk_ids passed to combine must be the ORIGINAL indices from
+        THIS rank's tokens, NOT the received indices from dispatch!
+
+        - original_topk_ids: [M, 8] - what THIS rank's M tokens selected
+        - recv_topk_ids: [N_recv, 8] - what was received (different shape!)
+
+        Combine uses original_topk_ids to:
+        1. Know what results THIS rank expects to receive
+        2. Route expert outputs back to the correct source tokens
+
+        MORI Combine Semantics:
+        =======================
+        For each token i on this rank:
+            output[i] = Σ(j=0..topk-1) expert_result[expert_j(i)] * weight[i,j]
+        
+        Where expert_result[e] came from the GPU owning expert e.
 
         Args:
-            output: [M, H] output buffer (written in-place)
-            fused_expert_output: Expert computation result
-            topk_weights: [M, K] original router weights
-            topk_ids: [M, K] original expert IDs
-            apply_router_weight_on_input: Whether weights were applied on input
-            weight_and_reduce_impl: Weight/reduce implementation
-            do_async: Whether to return async callable
+            output: [M, H] pre-allocated output buffer (written in-place)
+            fused_expert_output: [N_recv, H] expert computation results
+            topk_weights: [M, K] original router weights (may be used for reduce)
+            topk_ids: [M, K] original expert IDs (for method reference)
+            apply_router_weight_on_input: Whether weights were already applied
+            weight_and_reduce_impl: Implementation for weight/reduce step
+            do_async: If True, return callable for async completion
 
         Returns:
-            Callable for async mode, None for sync mode
+            If do_async: Callable that copies combined results to output
+            If not do_async: None (results already copied to output)
+
+        Implementation Notes:
+        ====================
+        - MORI combine returns fixed-size buffer [max_tokens, hidden]
+        - Must slice to actual batch size: combined_x[:num_tokens]
+        - We pass weights=None to combine (AITER already applied weights)
+        - call_reset=True to prepare for next iteration
         """
         ubatch_idx = dbo_current_ubatch_id()
 

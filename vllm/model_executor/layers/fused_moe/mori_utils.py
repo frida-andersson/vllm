@@ -1,24 +1,58 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-MORI buffer initialization utilities for Expert Parallelism.
+MORI-EP Utilities: Configuration, Operator Creation, and Memory Management.
 
 This module provides utilities for creating and managing MORI EP
-dispatch/combine operations in MoE layers.
+(Expert Parallelism) dispatch/combine operators for MoE layers on AMD GPUs.
+
+Key Components:
+===============
+1. MoriEpConfig: Dataclass holding all MORI EP configuration parameters
+2. create_mori_ep_op(): Factory function to create/cache MORI operators
+3. _ensure_mori_shmem_initialized(): Thread-safe shared memory initialization
+
+Operator Caching:
+=================
+MORI EP operators are CACHED and SHARED across all MoE layers!
+This is critical because:
+- Each operator allocates symmetric heap memory
+- A model like DeepSeek-R1 has 61 MoE layers
+- Without caching: 61 operators would exhaust symmetric heap
+- With caching: 1 operator shared by all layers
+
+Cache key includes: rank, world_size, hidden_dim, max_tokens, topk, etc.
+Same configuration → same operator reused.
+
+Memory Requirements:
+===================
+MORI requires symmetric heap memory for All-to-All communication buffers.
+The heap is SHARED across all GPUs (ranks).
+
+Memory calculation:
+  per_rank = max_tokens × hidden_dim × 16 bytes (BF16 + metadata)
+  total = per_rank × num_ranks
+
+Example for DeepSeek-R1 (EP8):
+  per_rank = 8192 × 7168 × 16 = 940 MB
+  total = 940 × 8 = 7.5 GB minimum
+  recommended = 12 GB
+
+CRITICAL: Set MORI_SHMEM_HEAP_SIZE BEFORE starting the server:
+  export MORI_SHMEM_HEAP_SIZE=12G
+
+Without this, you'll see "Out of symmetric heap memory" errors.
+
+Initialization Sequence:
+========================
+1. First call to create_mori_ep_op() triggers shmem initialization
+2. _ensure_mori_shmem_initialized() broadcasts unique ID from rank 0
+3. All ranks call shmem_init_attr() with the shared unique ID
+4. Subsequent calls to create_mori_ep_op() skip shmem init (already done)
+
+This is similar to NCCL initialization pattern.
 
 Reference: https://github.com/ROCm/mori
-
-IMPORTANT: MORI requires sufficient symmetric heap memory for All-to-All
-communication buffers. The heap is SHARED across all GPUs (ranks).
-
-Memory per rank: ~(max_tokens * hidden_dim * 16 bytes) ≈ 940 MB for DeepSeek R1
-Total heap needed: 940 MB * num_ranks (e.g., 8 GPUs = 7.5 GB minimum)
-
-Set the environment variable to increase heap size BEFORE starting the server:
-  export MORI_SHMEM_HEAP_SIZE=12G  # 12GB for EP8 with DeepSeek R1
-
-The benchmark script (bench_mori_ep_serve_markus.sh) sets this automatically.
-Without this, you'll see "Out of symmetric heap memory" errors.
 """
 import threading
 from dataclasses import dataclass
@@ -67,48 +101,115 @@ def is_mori_ep_available() -> bool:
 
 @dataclass
 class MoriEpConfig:
-    """Configuration for MORI EP dispatch/combine operations."""
+    """
+    Configuration for MORI EP dispatch/combine operations.
+
+    This dataclass holds all parameters needed to create a MORI EP operator.
+    The same config will result in the same cached operator.
+
+    Core Parameters:
+    ================
+    - rank: Current process rank in EP group (0 to world_size-1)
+    - world_size: Total number of EP ranks (EP size, e.g., 8 for EP8)
+    - hidden_dim: Model hidden dimension (e.g., 7168 for DeepSeek-R1)
+    - max_num_tokens: Maximum tokens per dispatch (e.g., 8192)
+    - num_experts: Total global experts (e.g., 256)
+    - topk: Experts selected per token (e.g., 8)
+
+    Quantization:
+    =============
+    - dtype: Token data type (default: bfloat16)
+    - use_fp8_dispatch: If True, use FP8 for 2x bandwidth savings
+
+    Kernel Selection:
+    =================
+    - kernel_type: Transport type
+        - "IntraNode": XGMI for single-node (800 GB/s aggregate)
+        - "InterNode": RDMA for multi-node (InfiniBand)
+        - "InterNodeV1", "InterNodeV1LL": Alternative multi-node impls
+
+    Performance Tuning:
+    ===================
+    - gpu_per_node: GPUs per node (8 for MI300X)
+    - warp_num_per_block: Warps per block (default 8)
+    - block_num: Thread blocks (default 80)
+    - rdma_block_num: Blocks for RDMA (InterNode only)
+    - num_qp_per_pe: Queue pairs per PE (RDMA tuning)
+
+    Example:
+    ========
+        config = MoriEpConfig(
+            rank=0,
+            world_size=8,
+            hidden_dim=7168,
+            max_num_tokens=8192,
+            num_experts=256,
+            topk=8,
+        )
+        ep_op = create_mori_ep_op(config)
+    """
 
     # Core configuration
     rank: int
-    world_size: int  # EP size
-    hidden_dim: int
-    max_num_tokens: int
-    num_experts: int
-    topk: int
+    world_size: int  # EP size (number of EP ranks)
+    hidden_dim: int  # Model hidden dimension
+    max_num_tokens: int  # Max tokens per batch/dispatch
+    num_experts: int  # Total experts globally
+    topk: int  # Experts per token (num_experts_per_token)
 
     # Data types
-    dtype: torch.dtype = torch.bfloat16
-    use_fp8_dispatch: bool = False
+    dtype: torch.dtype = torch.bfloat16  # Token data type
+    use_fp8_dispatch: bool = False  # Use FP8 for 2x bandwidth savings
 
     # Kernel type (IntraNode for XGMI, InterNode for RDMA)
     kernel_type: str = "IntraNode"
 
-    # Performance tuning
-    gpu_per_node: int = 8
-    warp_num_per_block: int = 8
-    block_num: int = 80
-    rdma_block_num: int = 0
-    num_qp_per_pe: int = 1
+    # Performance tuning parameters
+    gpu_per_node: int = 8  # GPUs per node (MI300X = 8)
+    warp_num_per_block: int = 8  # Warps per block
+    block_num: int = 80  # Total thread blocks
+    rdma_block_num: int = 0  # Blocks for RDMA (InterNode)
+    num_qp_per_pe: int = 1  # Queue pairs per PE (RDMA tuning)
 
     @property
     def num_experts_per_rank(self) -> int:
-        """Number of experts per EP rank."""
+        """
+        Number of experts per EP rank.
+        
+        Example: 256 experts / 8 ranks = 32 experts per rank
+        """
         return self.num_experts // self.world_size
 
     @property
     def scale_dim(self) -> int:
-        """Scale dimension for FP8 (hidden_dim // 128)."""
+        """
+        Scale dimension for FP8 quantization.
+        
+        FP8 uses per-128-element scales: hidden_dim // 128
+        Returns 0 if not using FP8 dispatch.
+        """
         return self.hidden_dim // 128 if self.use_fp8_dispatch else 0
 
     @property
     def scale_type_size(self) -> int:
-        """Size of scale type in bytes."""
+        """
+        Size of scale type in bytes.
+        
+        FP8 scales are float32 (4 bytes).
+        Returns 0 if not using FP8 dispatch.
+        """
         return 4 if self.use_fp8_dispatch else 0  # float32 scales
 
     @property
     def max_token_type_size(self) -> int:
-        """Size of token data type in bytes."""
+        """
+        Size of token data type in bytes.
+        
+        Used by MORI for buffer allocation:
+        - FP8: 1 byte
+        - FP16/BF16: 2 bytes
+        - FP32: 4 bytes
+        """
         if self.dtype == torch.float8_e4m3fn:
             return 1
         elif self.dtype == torch.float16 or self.dtype == torch.bfloat16:
@@ -230,18 +331,55 @@ def create_mori_ep_op(config: MoriEpConfig) -> "EpDispatchCombineOp":
     """
     Create or retrieve a cached MORI EP dispatch/combine operator.
     
-    IMPORTANT: MORI EP operators are shared across all MoE layers to avoid
-    exhausting the symmetric heap memory. Operators with the same configuration
-    are cached and reused.
+    This is the main factory function for MORI EP operators. It:
+    1. Ensures MORI shmem is initialized (first call only)
+    2. Checks cache for existing operator with same config
+    3. Creates new operator if not cached
+    4. Stores in cache for reuse by other MoE layers
+
+    CRITICAL: Operator Caching
+    ==========================
+    MORI EP operators are SHARED across all MoE layers! This is essential
+    because each operator allocates symmetric heap memory. A model like
+    DeepSeek-R1 has 61 MoE layers - without caching, we'd exhaust the heap.
+
+    The cache key includes: rank, world_size, hidden_dim, max_tokens, topk,
+    num_experts_per_rank, kernel_type, dtype, use_fp8_dispatch.
+
+    Same configuration → same cached operator returned.
+
+    Memory Warning:
+    ===============
+    If MORI_SHMEM_HEAP_SIZE is not set, this function logs a warning with
+    estimated memory requirements. Set this environment variable before
+    starting the server to avoid "Out of symmetric heap memory" errors.
+
+    Thread Safety:
+    ==============
+    This function is thread-safe. Uses locks for both shmem initialization
+    and cache access to prevent race conditions in multi-threaded scenarios.
 
     Args:
-        config: MoriEpConfig with all required parameters.
+        config: MoriEpConfig with all required parameters including:
+            - rank, world_size: EP group configuration
+            - hidden_dim, max_num_tokens: Buffer sizing
+            - num_experts, topk: Expert configuration
+            - kernel_type: "IntraNode" (XGMI) or "InterNode" (RDMA)
 
     Returns:
-        EpDispatchCombineOp: MORI EP operator handle (may be shared).
+        EpDispatchCombineOp: MORI EP operator handle.
+            May be a cached instance if same config was used before.
 
     Raises:
         RuntimeError: If MORI-EP is not installed or operator creation fails.
+
+    Example:
+        config = MoriEpConfig(rank=0, world_size=8, hidden_dim=7168,
+                              max_num_tokens=8192, num_experts=256, topk=8)
+        ep_op = create_mori_ep_op(config)
+        
+        # Later, same config returns cached operator:
+        ep_op2 = create_mori_ep_op(config)  # Same object as ep_op
     """
     import os
     
