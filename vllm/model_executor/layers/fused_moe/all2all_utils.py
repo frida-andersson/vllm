@@ -6,6 +6,7 @@ import torch
 
 from vllm.distributed import (
     get_ep_group,
+    get_tp_group,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
@@ -103,11 +104,16 @@ def maybe_make_prepare_finalize(
     # on local experts, scatter + all-reduce.  This path does NOT
     # require a MoriAll2AllManager or MORI shmem initialization.
     if moe.use_mori_dispatch_free:
-        ep_group_coord = get_ep_group()
         ep_size = moe.moe_parallel_config.ep_size
         ep_rank = moe.moe_parallel_config.ep_rank
         num_local_experts = moe.num_experts // ep_size
         rank_expert_offset = ep_rank * num_local_experts
+
+        # Use the TP group for the all-reduce in finalize.  In TP+EP
+        # without DP the TP and EP groups contain the same ranks, but
+        # the TP group has the fast CUDAGraph-compatible custom
+        # all-reduce (P2P / QuickReduce) already initialised.
+        tp_group_coord = get_tp_group()
 
         prepare_finalize = MoriPrepareAndFinalize(
             mori_op=None,
@@ -116,7 +122,7 @@ def maybe_make_prepare_finalize(
             use_fp8_dispatch=False,
             num_local_experts=num_local_experts,
             rank_expert_offset=rank_expert_offset,
-            ep_group=ep_group_coord,
+            ep_group=tp_group_coord,
             enable_dispatch_free=True,
         )
         return prepare_finalize
