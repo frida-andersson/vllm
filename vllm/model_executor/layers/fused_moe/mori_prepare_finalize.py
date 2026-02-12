@@ -207,44 +207,22 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> mk.PrepareResultType:
         """Dispatch-free prepare for TP+EP mode (CUDAGraph-compatible).
 
-        All tensors keep their original shape -- no ``nonzero()`` or
-        dynamic indexing.  Non-local expert slots are zero-weighted and
-        their IDs clamped into [0, num_local_experts) so the AITER kernel
-        runs on a fixed-size buffer.  The ``expert_num_tokens`` metadata
-        tells AITER how many tokens each local expert actually has.
+        This is a **pass-through**: activations, topk_ids and topk_weights
+        are forwarded to the expert kernel unchanged.  The expert kernel
+        (AITER) receives the *global* expert IDs together with the
+        ``expert_map`` / ``expert_mask`` that the FusedMoE layer already
+        provides.  AITER's ``moe_sorting_fwd`` uses that mask to skip
+        GEMMs for non-local experts entirely, so each GPU only computes
+        the ~1 local expert per token (out of topk=8), avoiding cache
+        thrashing from touching all 256 experts' weights.
+
+        No ID remapping, no zero-weighting, no expert counting is done
+        here -- all of that is handled inside the AITER kernel via the
+        expert mask.
         """
-        assert self.rank_expert_offset is not None
-        assert self.num_local_experts is not None
-
-        # 1. Identify which (token, slot) pairs target a local expert
-        local_expert_ids = topk_ids - self.rank_expert_offset
-        is_local = (local_expert_ids >= 0) & (
-            local_expert_ids < self.num_local_experts
-        )
-
-        # 2. Zero-weight non-local slots, clamp IDs to valid range
-        topk_weights = topk_weights * is_local.float()
-        local_expert_ids = local_expert_ids.clamp(0, self.num_local_experts - 1)
-
-        # 3. Count tokens per local expert (fully static shapes,
-        #    CUDAGraph-compatible -- no boolean indexing or nonzero).
-        #    Use the zero-weighted IDs directly; non-local slots have
-        #    weight == 0 so they won't contribute to expert computation,
-        #    but we still count only truly-local slots for metadata.
-        local_ids_flat = local_expert_ids.reshape(-1).to(torch.int64)
-        is_local_flat = is_local.reshape(-1).to(torch.int64)
-        expert_counts = torch.zeros(
-            self.num_local_experts, dtype=torch.int64, device=topk_ids.device
-        )
-        expert_counts.scatter_add_(0, local_ids_flat, is_local_flat)
-        expert_counts = expert_counts.to(torch.int32)
-
-        expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=expert_counts, expert_num_tokens_cpu=None
-        )
-
-        # a1 is passed through unchanged (same shape as input).
-        return (a1, None, expert_tokens_meta, local_expert_ids, topk_weights)
+        # Pure pass-through.  expert_tokens_meta = None lets the expert
+        # kernel derive token counts from topk_ids + expert_map itself.
+        return (a1, None, None, topk_ids, topk_weights)
     
     def _finalize_dispatch_free(
         self,

@@ -68,9 +68,9 @@ class BenchmarkResult:
     topk: int
     ep_size: int
     total_us: float
-    filter_us: float | None = None
+    prepare_us: float | None = None
     compute_us: float | None = None
-    scatter_allreduce_us: float | None = None
+    allreduce_us: float | None = None
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -127,57 +127,53 @@ def bench_dispatch_free(
     ep_group: torch.distributed.ProcessGroup,
     num_iters: int,
     warmup: int,
+    num_experts: int = 256,
 ) -> tuple[float, float, float, float]:
     """
     Benchmark the dispatch-free TP+EP pipeline.
 
-    Returns (total_us, filter_us, compute_us, scatter_allreduce_us).
+    The prepare phase is a pure pass-through (no filtering, no ID
+    remapping).  AITER's ``expert_mask`` skips GEMMs for non-local
+    experts, so each GPU only computes the ~1 local expert per token.
+
+    Returns (total_us, prepare_us, compute_us, allreduce_us).
     """
     from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
         rocm_aiter_fused_experts,
     )
 
+    # Build expert_mask: 1 for local experts, 0 for others + sentinel
     rank_offset = rank * num_local_experts
-    hidden = x.shape[1]
+    expert_mask = torch.zeros(num_experts + 1, dtype=torch.int32, device=x.device)
+    expert_mask[rank_offset : rank_offset + num_local_experts] = 1
 
-    # ── Step 1-2: filter + remap (fused into one function) ──────
-    def _filter():
-        local_end = rank_offset + num_local_experts
-        is_local = (topk_ids >= rank_offset) & (topk_ids < local_end)
-        needs_local = is_local.any(dim=1)
+    # ── Step 1: prepare (pass-through, measure overhead) ──────
+    def _prepare():
+        # In vllm serve mode this is a no-op; measure the baseline
+        return x, topk_weights, topk_ids
 
-        idx = needs_local.nonzero(as_tuple=True)[0]
-        local_x = x[idx]
-        local_ids = topk_ids[idx] - rank_offset
-        local_w = topk_weights[idx]
+    prepare_us = _timer(num_iters, warmup, _prepare)
 
-        # zero-weight non-local slots, clamp ids so AITER doesn't OOB
-        slot_local = (local_ids >= 0) & (local_ids < num_local_experts)
-        local_w = local_w * slot_local.float()
-        local_ids = local_ids.clamp(0, num_local_experts - 1)
-        return idx, local_x, local_w, local_ids
-
-    filter_us = _timer(num_iters, warmup, _filter)
-    idx, local_x, local_w, local_ids = _filter()
-
-    # ── Step 3: AITER compute ───────────────────────────────────
+    # ── Step 2: AITER compute with expert_mask ────────────────
     def _compute():
-        return rocm_aiter_fused_experts(local_x, w1, w2, local_w, local_ids)
+        return rocm_aiter_fused_experts(
+            x, w1, w2, topk_weights, topk_ids,
+            expert_map=expert_mask,
+        )
 
     compute_us = _timer(num_iters, warmup, _compute)
     expert_out = _compute()
 
-    # ── Step 4-5: scatter + all-reduce ──────────────────────────
-    def _scatter_allreduce():
-        buf = torch.zeros_like(x)
-        buf[idx] = expert_out[: len(idx)]
+    # ── Step 3: all-reduce ────────────────────────────────────
+    def _allreduce():
+        buf = expert_out.clone()
         torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM, group=ep_group)
         return buf
 
-    scatter_ar_us = _timer(num_iters, warmup, _scatter_allreduce)
+    allreduce_us = _timer(num_iters, warmup, _allreduce)
 
-    total_us = filter_us + compute_us + scatter_ar_us
-    return total_us, filter_us, compute_us, scatter_ar_us
+    total_us = prepare_us + compute_us + allreduce_us
+    return total_us, prepare_us, compute_us, allreduce_us
 
 
 # ── AITER-only baseline ────────────────────────────────────────────
@@ -209,16 +205,16 @@ def _print_results(results: list[BenchmarkResult]):
     print("=" * 115)
     hdr = (
         f"{'Label':<30} {'Tokens':<8} {'EP':<4} "
-        f"{'Total (µs)':<14} {'Filter (µs)':<14} "
-        f"{'Compute (µs)':<14} {'Scat+AR (µs)':<14} "
+        f"{'Total (µs)':<14} {'Prepare (µs)':<14} "
+        f"{'Compute (µs)':<14} {'AR (µs)':<14} "
         f"{'Tput (tok/s)':<16}"
     )
     print(hdr)
     print("-" * 115)
     for r in results:
-        f = f"{r.filter_us:.1f}" if r.filter_us is not None else "N/A"
+        f = f"{r.prepare_us:.1f}" if r.prepare_us is not None else "N/A"
         c = f"{r.compute_us:.1f}" if r.compute_us is not None else "N/A"
-        s = f"{r.scatter_allreduce_us:.1f}" if r.scatter_allreduce_us is not None else "N/A"
+        s = f"{r.allreduce_us:.1f}" if r.allreduce_us is not None else "N/A"
         tput = r.num_tokens / r.total_us * 1e6
         print(
             f"{r.label:<30} {r.num_tokens:<8} {r.ep_size:<4} "
@@ -429,17 +425,18 @@ def cmd_kernel(args: argparse.Namespace) -> None:
                 num_tokens, args.hidden_size, args.num_experts,
                 args.topk, num_local,
             )
-            total, filt, comp, scat = bench_dispatch_free(
+            total, prep, comp, ar = bench_dispatch_free(
                 x, tw, ti, w1, w2,
                 rank=rank, num_local_experts=num_local, ep_group=ep_group,
                 num_iters=args.num_iters, warmup=args.warmup,
+                num_experts=args.num_experts,
             )
             results.append(BenchmarkResult(
                 label="dispatch-free EP8", num_tokens=num_tokens,
                 hidden_size=args.hidden_size, num_experts=args.num_experts,
                 topk=args.topk, ep_size=world,
-                total_us=total, filter_us=filt,
-                compute_us=comp, scatter_allreduce_us=scat,
+                total_us=total, prepare_us=prep,
+                compute_us=comp, allreduce_us=ar,
             ))
             del x, tw, ti, w1, w2
 
