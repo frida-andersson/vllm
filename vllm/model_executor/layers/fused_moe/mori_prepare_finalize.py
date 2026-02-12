@@ -33,7 +33,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     2. **Dispatch-free mode** (TP+EP) -- all GPUs already hold the full
        token batch after TP all-reduce, so dispatch is skipped entirely.
-       Each GPU filters locally, computes on its experts, then all-reduces.
+       Each GPU filters locally, computes on its experts, then all-reduces
+       using a MORI-shmem-backed reducer that selects the optimal
+       communication strategy.
        ``mori_op`` may be ``None`` in this mode.
     """
 
@@ -54,7 +56,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
-        
+
         # TP+EP dispatch-free optimization
         self.use_dispatch_free = (
             _DISPATCH_FREE_ENABLED
@@ -66,13 +68,27 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_local_experts = num_local_experts
         self.rank_expert_offset = rank_expert_offset
         self.ep_group = ep_group
-        
-        
+        self._shmem_reducer = None
+
         if self.use_dispatch_free:
+            # Initialize the MORI-shmem-backed reducer for the EP
+            # all-reduce.  This sets up MORI's symmetric shared memory
+            # infrastructure and selects the optimal all-reduce strategy
+            # (P2P 1-stage for small tensors, RCCL ring for larger ones).
+            from vllm.distributed.device_communicators.mori_shmem_reduce import (
+                MoriShmemReducer,
+            )
+
+            self._shmem_reducer = MoriShmemReducer(
+                ep_group=ep_group,
+                world_size=ep_group.world_size,
+                rank=ep_group.rank_in_group,
+            )
             logger.info(
                 "MORI-EP dispatch-free optimization enabled. "
                 "Dispatch All-to-All will be skipped. "
-                "Using CUDAGraph-compatible all-reduce for aggregation."
+                "Using MoriShmemReducer (strategy=%s) for aggregation.",
+                self._shmem_reducer.strategy,
             )
 
     @property
@@ -236,13 +252,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         already has the correct (M, K) shape.  Each rank's contribution is
         non-zero only for its local experts, so a SUM all-reduce across the
         EP group produces the correct combined result.
+
+        Uses the MoriShmemReducer which selects the optimal all-reduce
+        strategy based on tensor size:
+        - Small tensors: P2P 1-stage (custom_allreduce) for low latency
+        - Larger tensors: RCCL ring (pynccl) for bandwidth efficiency
         """
-        assert self.ep_group is not None, (
-            "Expert parallel group required for dispatch-free finalize"
+        assert self._shmem_reducer is not None, (
+            "MoriShmemReducer required for dispatch-free finalize"
         )
 
         # fused_expert_output is (M, K) -- same shape as output.
-        # Use GroupCoordinator.all_reduce which is CUDAGraph-safe
-        # (it dispatches through custom_all_reduce / pynccl).
-        reduced = self.ep_group.all_reduce(fused_expert_output)
+        # The MoriShmemReducer selects between custom_allreduce (P2P
+        # 1-stage) and pynccl (RCCL ring) based on tensor size.
+        # Both paths are CUDAGraph-safe.
+        reduced = self._shmem_reducer.all_reduce(fused_expert_output)
         output.copy_(reduced)
