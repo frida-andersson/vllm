@@ -903,6 +903,22 @@ class FusedMoEParallelConfig:
     def use_mori_kernels(self):
         return self.use_all2all_kernels and self.all2all_backend == "mori"
 
+    @property
+    def use_mori_dispatch_free(self):
+        """Dispatch-free MORI path for TP+EP: no All-to-All needed.
+
+        When all GPUs already hold the full token batch (after TP
+        all-reduce), the MoE layer can skip dispatch entirely.  Each
+        GPU filters locally, computes on its experts, then all-reduces.
+        This path is available even without data-parallelism
+        (``dp_size == 1``).
+        """
+        return (
+            self.use_ep
+            and self.ep_size > 1
+            and self.all2all_backend == "mori"
+        )
+
     @staticmethod
     def flatten_tp_across_dp_and_pcp(
         tp_size: int, dp_size: int, dp_rank: int, pcp_size: int, pcp_rank: int
@@ -1155,6 +1171,10 @@ class FusedMoEConfig:
     @property
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
+
+    @property
+    def use_mori_dispatch_free(self):
+        return self.moe_parallel_config.use_mori_dispatch_free
 
     @property
     def use_fi_all2allv_kernels(self):

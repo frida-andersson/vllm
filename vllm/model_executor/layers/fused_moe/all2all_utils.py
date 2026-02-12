@@ -40,8 +40,9 @@ if current_platform.is_cuda_alike():
             DEEPEP_QUANT_BLOCK_SHAPE,
             DeepEPLLPrepareAndFinalize,
         )
-    if has_mori():
-        from .mori_prepare_finalize import MoriPrepareAndFinalize
+    # MoriPrepareAndFinalize is always imported because its dispatch-free
+    # mode does not depend on the mori library (no All-to-All ops).
+    from .mori_prepare_finalize import MoriPrepareAndFinalize
 
 
 def maybe_roundup_layer_hidden_size(
@@ -96,6 +97,30 @@ def maybe_make_prepare_finalize(
     #   * maybe_make_prepare_finalize() is called from the oracle. We
     #     always return a PrepareAndFinalize object and the quant method
     #     holds the ModularKernel.
+    # ── Dispatch-free MORI path (TP+EP, no All-to-All needed) ──────
+    # When all GPUs already hold the full token batch after TP
+    # all-reduce, we skip dispatch entirely: filter locally, compute
+    # on local experts, scatter + all-reduce.  This path does NOT
+    # require a MoriAll2AllManager or MORI shmem initialization.
+    if moe.use_mori_dispatch_free:
+        ep_group_coord = get_ep_group()
+        ep_size = moe.moe_parallel_config.ep_size
+        ep_rank = moe.moe_parallel_config.ep_rank
+        num_local_experts = moe.num_experts // ep_size
+        rank_expert_offset = ep_rank * num_local_experts
+
+        prepare_finalize = MoriPrepareAndFinalize(
+            mori_op=None,
+            max_tokens_per_rank=moe.max_num_tokens,
+            num_dispatchers=ep_size,
+            use_fp8_dispatch=False,
+            num_local_experts=num_local_experts,
+            rank_expert_offset=rank_expert_offset,
+            ep_group=ep_group_coord,
+            enable_dispatch_free=True,
+        )
+        return prepare_finalize
+
     if not moe.moe_parallel_config.use_all2all_kernels:
         if not allow_new_interface:
             return None
@@ -208,15 +233,13 @@ def maybe_make_prepare_finalize(
             local_expert_global_ids=local_expert_global_ids,
         )
     elif moe.use_mori_kernels:
+        # Standard MORI dispatch (DP+EP with All-to-All).
+        # The dispatch-free TP+EP case is handled above.
         assert quant_config is not None
 
-        # Note: We may want to use FP8 dispatch just to reduce
-        # data movement.
         use_fp8_dispatch = (
             quant_config.is_per_act_token or quant_config.is_block_quantized
         )
-        # For PTPC (per token per channel) quant, the scale dim for each token is 1
-        # For 1x128 quant, the scale dim for each token is hidden_dim // 128
         scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
         all_to_all_args = dict(
             rank=all2all_manager.rank,
@@ -232,36 +255,12 @@ def maybe_make_prepare_finalize(
         )
         handle = all2all_manager.get_handle(all_to_all_args)
 
-        # Detect TP+EP mode for dispatch-free optimization
-        use_tp_ep = (
-            moe.moe_parallel_config.tp_size > 1
-            and moe.moe_parallel_config.use_ep
+        prepare_finalize = MoriPrepareAndFinalize(
+            handle,
+            max_tokens_per_rank=moe.max_num_tokens,
+            num_dispatchers=all2all_manager.world_size,
+            use_fp8_dispatch=use_fp8_dispatch,
         )
-
-        if use_tp_ep:
-            # Enable dispatch-free optimization for TP+EP
-            num_local_experts = moe.num_experts // all2all_manager.world_size
-            rank_expert_offset = all2all_manager.rank * num_local_experts
-            ep_group = get_ep_group().device_group
-
-            prepare_finalize = MoriPrepareAndFinalize(
-                handle,
-                max_tokens_per_rank=moe.max_num_tokens,
-                num_dispatchers=all2all_manager.world_size,
-                use_fp8_dispatch=use_fp8_dispatch,
-                num_local_experts=num_local_experts,
-                rank_expert_offset=rank_expert_offset,
-                ep_group=ep_group,
-                enable_dispatch_free=True,
-            )
-        else:
-            # Standard MORI dispatch
-            prepare_finalize = MoriPrepareAndFinalize(
-                handle,
-                max_tokens_per_rank=moe.max_num_tokens,
-                num_dispatchers=all2all_manager.world_size,
-                use_fp8_dispatch=use_fp8_dispatch,
-            )
 
     elif moe.use_fi_all2allv_kernels:
         assert quant_config is not None
