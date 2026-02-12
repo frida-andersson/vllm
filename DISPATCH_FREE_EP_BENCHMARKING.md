@@ -74,12 +74,47 @@ thrashing benefit was not realized.
 
 ### Results AFTER expert_mask optimization (commit `70c5558f4`)
 
-**Not yet measured** -- GPUs were lost before benchmarking. This is the
-primary thing to measure next. The expected improvement is significant
-for prefill (large batches) due to:
-- 8x less MoE compute per GPU
-- Active weight working set fits in L2 cache
-- See `moe_cache_trashing_roofline.html` for theoretical analysis
+**Measured 2025-02-12** on the same hardware/workload as above (8x MI300X,
+ISL=512, OSL=128, 200 requests, rate=10). Second runs (JIT caches warm).
+
+| Metric | TP8 baseline | TP8+EP8 dispatch-free | Delta |
+|--------|-------------|----------------------|-------|
+| Output throughput (tok/s) | 998.86 | 1,019.52 | **+2.1%** |
+| Total throughput (tok/s) | 4,986.51 | 5,089.63 | **+2.1%** |
+| Request throughput (req/s) | 7.80 | 7.96 | **+2.1%** |
+| Mean TTFT (ms) | 657.52 | 597.50 | **-9.1%** |
+| Median TTFT (ms) | 520.43 | 393.91 | **-24.3%** |
+| P99 TTFT (ms) | 2,830.65 | 3,173.57 | +12.1% |
+| Mean TPOT (ms) | 100.60 | 87.32 | **-13.2%** |
+| Median TPOT (ms) | 105.61 | 94.53 | **-10.5%** |
+| P99 TPOT (ms) | 145.91 | 114.92 | **-21.2%** |
+| Mean ITL (ms) | 100.60 | 87.32 | **-13.2%** |
+| Median ITL (ms) | 49.40 | 46.20 | **-6.5%** |
+| P99 ITL (ms) | 261.07 | 212.97 | **-18.4%** |
+| Peak output throughput (tok/s) | 4,018 | 2,519 | -37.3% |
+
+**Key observations:**
+
+1. **Throughput**: +2.1% improvement across all throughput metrics.
+2. **Decode latency (TPOT)**: 13.2% mean / 21.2% P99 improvement -- the
+   biggest win, directly attributable to reduced MoE compute via
+   `expert_mask`.
+3. **Prefill latency (TTFT)**: Mean improved 9.1%, median improved 24.3%,
+   but P99 regressed 12.1% (outlier prefills pay the all-reduce cost).
+4. **Peak throughput regression**: -37.3% lower peak burst -- the EP
+   all-reduce serializes at the peak.
+5. **Compared to pre-expert_mask**: The optimization turned a -0.8%
+   throughput / +14% TPOT regression into a +2.1% throughput / -13.2%
+   TPOT improvement.
+
+**What still needs investigation:**
+- The improvements are modest given the theoretical 8x MoE compute
+  reduction. Profiling is needed to understand where the remaining time
+  is spent (all-reduce overhead, CUDAGraph overhead, non-MoE layers).
+- Peak throughput regression suggests the all-reduce is a bottleneck
+  under high concurrency.
+- Larger batch / longer sequence benchmarks (ISL=4096) may show more
+  benefit since cache thrashing is worse at higher batch sizes.
 
 ## How to Run Benchmarks
 

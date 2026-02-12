@@ -254,6 +254,7 @@ def _start_server(
     env = os.environ.copy()
     env["VLLM_ROCM_USE_AITER"] = "1"
     env["VLLM_ROCM_USE_AITER_MOE"] = "1"
+    env["VLLM_RPC_TIMEOUT"] = "1800000"
 
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
@@ -359,8 +360,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         )
         try:
             print(">>> Waiting for server to become ready ...")
-            if not _wait_for_server(args.port, timeout=1200):
-                print(">>> ERROR: server did not become ready in 600s")
+            if not _wait_for_server(args.port, timeout=2400):
+                print(">>> ERROR: server did not become ready in 2400s")
                 print(f">>> Last 80 lines of server log ({_SERVER_LOG}):")
                 try:
                     with open(_SERVER_LOG) as f:
