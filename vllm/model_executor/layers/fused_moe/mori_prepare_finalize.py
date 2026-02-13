@@ -50,6 +50,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         rank_expert_offset: int | None = None,
         ep_group: object | None = None,  # GroupCoordinator (graph-safe)
         enable_dispatch_free: bool = True,
+        hidden_dim: int = 3072,
     ):
         super().__init__()
         self.mori_op = mori_op
@@ -73,8 +74,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if self.use_dispatch_free:
             # Initialize the MORI-shmem-backed reducer for the EP
             # all-reduce.  This sets up MORI's symmetric shared memory
-            # infrastructure and selects the optimal all-reduce strategy
-            # (P2P 1-stage for small tensors, RCCL ring for larger ones).
+            # infrastructure for P2P all-reduce via XGMI.
             from vllm.distributed.device_communicators.mori_shmem_reduce import (
                 MoriShmemReducer,
             )
@@ -83,6 +83,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 ep_group=ep_group,
                 world_size=ep_group.world_size,
                 rank=ep_group.rank_in_group,
+                max_num_tokens=max_tokens_per_rank,
+                hidden_dim=hidden_dim,
             )
             logger.info(
                 "MORI-EP dispatch-free optimization enabled. "

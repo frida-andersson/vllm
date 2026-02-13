@@ -10,8 +10,10 @@
 #   --osl N             Output sequence length (default: 300)
 #   --num-prompts N     Number of concurrent prompts (default: 10)
 #   --tp N              Tensor parallel size (default: 8)
-#   --backend BACKEND   All2All backend: mori_ep, deepep_high_throughput, etc.
+#   --backend BACKEND   All2All backend: mori, dispatch_free,
+#                       deepep_high_throughput, etc.
 #                       Use "none" or "tp_only" for basic TP without EP
+#   --num-runs N        Number of benchmark iterations (default: 2, first is JIT warmup)
 #   --server-only       Only start the server, don't run benchmark
 #   --bench-only        Only run benchmark (server must be running)
 #   --port N            Server port (default: 8000)
@@ -32,12 +34,13 @@ ISL=70000          # Input Sequence Length
 OSL=300            # Output Sequence Length
 NUM_PROMPTS=10     # Concurrency
 TP_SIZE=8          # Tensor Parallel (EP uses TP ranks for expert distribution)
-BACKEND="mori_ep"  # All2All backend
+BACKEND="mori"     # All2All backend (valid: mori, pplx, deepep_high_throughput, etc.)
 HOST="localhost"
 PORT=8000
 SERVER_ONLY=false
 BENCH_ONLY=false
 MAX_MODEL_LEN=72000  # ISL + some buffer
+NUM_RUNS=2         # Number of benchmark runs (>=2 recommended: 1st run has JIT warmup)
 
 # Enable AITER for ROCm
 export VLLM_ROCM_USE_AITER=1
@@ -98,6 +101,10 @@ while [[ $# -gt 0 ]]; do
             MAX_MODEL_LEN="$2"
             shift 2
             ;;
+        --num-runs)
+            NUM_RUNS="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -109,10 +116,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --osl N             Output sequence length (default: 300)"
             echo "  --num-prompts N     Concurrent prompts (default: 10)"
             echo "  --tp N              Tensor parallel size (default: 8)"
-            echo "  --backend BACKEND   All2All backend (default: mori_ep)"
-            echo "                      Options: mori_ep, deepep_high_throughput,"
+            echo "  --backend BACKEND   All2All backend (default: mori)"
+            echo "                      Options: mori, dispatch_free,"
+            echo "                               deepep_high_throughput,"
             echo "                               deepep_low_latency, pplx, naive,"
             echo "                               none/tp_only (basic TP, no EP)"
+            echo "  --num-runs N        Benchmark iterations (default: 2, 1st is JIT warmup)"
             echo "  --server-only       Only start server"
             echo "  --bench-only        Only run benchmark (server must be running)"
             echo "  --host HOST         Server host (default: localhost)"
@@ -145,6 +154,7 @@ echo "OSL:          $OSL"
 echo "Concurrency:  $NUM_PROMPTS"
 echo "TP Size:      $TP_SIZE"
 echo "Backend:      $BACKEND"
+echo "Num Runs:     $NUM_RUNS"
 echo "Host:         $HOST:$PORT"
 echo "Max Model Len: $MAX_MODEL_LEN"
 echo "=========================================="
@@ -168,14 +178,18 @@ start_server() {
     )
     
     # Add expert parallel flags unless using basic TP
-    if [[ "$BACKEND" != "none" && "$BACKEND" != "tp_only" ]]; then
+    if [[ "$BACKEND" == "none" || "$BACKEND" == "tp_only" ]]; then
+        echo "Mode: Basic Tensor Parallel (TP$TP_SIZE, no EP)"
+    elif [[ "$BACKEND" == "dispatch_free" ]]; then
+        # Dispatch-free EP: uses MORI backend but skips All-to-All dispatch,
+        # performing local expert computation + all-reduce instead.
+        export VLLM_MORI_EP_DISPATCH_FREE=1
+        SERVER_ARGS+=("--enable-expert-parallel" "--all2all-backend" "mori")
+        echo "Mode: Expert Parallel (EP) with MORI dispatch-free"
+        echo "  VLLM_MORI_EP_DISPATCH_FREE=1"
+    else
         SERVER_ARGS+=("--enable-expert-parallel" "--all2all-backend" "$BACKEND")
         echo "Mode: Expert Parallel (EP) with $BACKEND"
-        
-        # MORI-EP dispatch-free: CUDAGraph-compatible (no dynamic shapes).
-        # No special compilation flags needed.
-    else
-        echo "Mode: Basic Tensor Parallel (TP$TP_SIZE, no EP)"
     fi
     
     # For DeepSeek R1, use FP8 KV cache for memory efficiency
@@ -188,28 +202,59 @@ start_server() {
     exec "${SERVER_ARGS[@]}"
 }
 
-# Function to run benchmark
+# Function to run benchmark (single iteration)
+run_benchmark_once() {
+    local run_num=$1
+    local total_runs=$2
+    local label=""
+    if [[ $run_num -eq 1 && $total_runs -ge 2 ]]; then
+        label=" (JIT warmup - discard this result)"
+    else
+        label=" (measurement run $run_num/$total_runs)"
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "Benchmark run $run_num/$total_runs${label}"
+    echo "=========================================="
+    echo ""
+
+    # Build benchmark command as array for proper quoting
+    BENCH_ARGS=(
+        "vllm" "bench" "serve"
+        "--model" "$MODEL"
+        "--served-model-name" "$MODEL"
+        "--host" "$HOST"
+        "--port" "$PORT"
+        "--dataset-name" "random"
+        "--input-len" "$ISL"
+        "--output-len" "$OSL"
+        "--num-prompts" "$NUM_PROMPTS"
+        "--request-rate" "inf"
+    )
+
+    echo "Command: ${BENCH_ARGS[*]}"
+    echo ""
+
+    # Run benchmark
+    "${BENCH_ARGS[@]}"
+    echo ""
+}
+
+# Function to run all benchmark iterations
 run_benchmark() {
     echo ""
-    echo "Running vllm bench serve..."
+    echo "Running $NUM_RUNS benchmark iteration(s)..."
+    echo "  (Run 1 includes JIT compilation overhead; runs 2+ are clean measurements)"
     echo ""
-    
-    # Build benchmark command
-    BENCH_CMD="vllm bench serve"
-    BENCH_CMD="$BENCH_CMD --model $MODEL"
-    BENCH_CMD="$BENCH_CMD --host $HOST"
-    BENCH_CMD="$BENCH_CMD --port $PORT"
-    BENCH_CMD="$BENCH_CMD --dataset-name random"
-    BENCH_CMD="$BENCH_CMD --input-len $ISL"
-    BENCH_CMD="$BENCH_CMD --output-len $OSL"
-    BENCH_CMD="$BENCH_CMD --num-prompts $NUM_PROMPTS"
-    BENCH_CMD="$BENCH_CMD --request-rate inf"  # Send all at once for concurrency test
-    
-    echo "Command: $BENCH_CMD"
-    echo ""
-    
-    # Run benchmark
-    $BENCH_CMD
+
+    for (( i=1; i<=NUM_RUNS; i++ )); do
+        run_benchmark_once "$i" "$NUM_RUNS"
+    done
+
+    echo "=========================================="
+    echo "All $NUM_RUNS benchmark runs complete."
+    echo "=========================================="
 }
 
 # Main logic

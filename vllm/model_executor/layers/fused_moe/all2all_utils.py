@@ -115,15 +115,28 @@ def maybe_make_prepare_finalize(
         # all-reduce (P2P / QuickReduce) already initialised.
         tp_group_coord = get_tp_group()
 
+        # For the MORI P2P all-reduce buffer, we need at least
+        # max_cudagraph_capture_size tokens.  Use a generous upper
+        # bound that covers both CUDAGraph captures and profiling.
+        from vllm.config import get_current_vllm_config
+        vllm_config = get_current_vllm_config()
+        max_capture = getattr(
+            vllm_config.compilation_config,
+            "max_cudagraph_capture_size", 512
+        ) or 512
+        # Buffer at least as large as the biggest CUDAGraph batch.
+        mori_buf_tokens = max(moe.max_num_tokens, max_capture)
+
         prepare_finalize = MoriPrepareAndFinalize(
             mori_op=None,
-            max_tokens_per_rank=moe.max_num_tokens,
+            max_tokens_per_rank=mori_buf_tokens,
             num_dispatchers=ep_size,
             use_fp8_dispatch=False,
             num_local_experts=num_local_experts,
             rank_expert_offset=rank_expert_offset,
             ep_group=tp_group_coord,
             enable_dispatch_free=True,
+            hidden_dim=moe.hidden_dim,
         )
         return prepare_finalize
 
