@@ -1,0 +1,3 @@
+[submodule "3rdparty/mori"]
+	path = 3rdparty/mori
+	url = https://github.com/maeehart/mori.git
