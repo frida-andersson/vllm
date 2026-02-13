@@ -1,6 +1,6 @@
 # Dispatch-Free EP vs TP8 Profiling Analysis
 
-**Date:** 2026-02-13
+**Date:** 2026-02-13 (updated with fmoe experiment)
 **Model:** DeepSeek-R1 (671B params, 61 layers, 256 routed experts + shared experts, top-8 routing)
 **Hardware:** 8× AMD MI300X (192GB VRAM each), XGMI interconnect
 **vLLM version:** 0.1.dev13690+g13dcb3ed3
@@ -13,10 +13,18 @@ consume 85-87% of GPU time in both configurations**, and EP dispatch-free introd
 additional all-reduce calls per profiled workload (~1 extra per MoE layer per step) that negate
 any MoE kernel savings.
 
+**Update (fmoe experiment):** We investigated whether AITER's 2-stage CK MoE kernels
+(`ck_moe_stage1` + `ck_moe_stage2`) used during decode were suboptimal. By patching AITER to
+force the fused 1-stage kernel (`fmoe_fp8_blockscale_g1u1`) for ALL token counts (not just
+M>32), we confirmed that **the MoE kernel choice has negligible impact** since MoE compute
+is only ~2-3% of total GPU time. The all-reduce bottleneck remains the dominant factor.
+
 ## 2. End-to-End Benchmark Results
 
 Workload: DeepSeek R1, ISL=70,000, OSL=300, 10 concurrent prompts, request-rate=inf.
 Server mode with CUDA graphs enabled. Two runs per configuration (first discarded as JIT warmup).
+
+### 2.1 Baseline (2-stage CK MoE for decode, default AITER)
 
 | Metric                      | TP8 Baseline | EP8 Dispatch-Free | Delta          |
 |-----------------------------|-------------|-------------------|----------------|
@@ -32,6 +40,37 @@ Server mode with CUDA graphs enabled. Two runs per configuration (first discarde
 | P99 TPOT (ms)               | 100.08      | 102.78            | +2.7%          |
 
 **Verdict:** Within measurement noise. EP dispatch-free is at parity with TP8.
+
+### 2.2 With fmoe Patch (forced 1-stage fused MoE for all token counts)
+
+AITER patch: Changed `run_1stage = token > 32 and (inter_dim % 256 == 0)` to
+`run_1stage = (inter_dim % 256 == 0)` in `/usr/local/lib/python3.12/dist-packages/aiter/fused_moe.py`
+line 719. This forces the fused `fmoe_fp8_blockscale_g1u1` kernel for decode (M<=32) instead
+of the 2-stage `ck_moe_stage1` + `ck_moe_stage2` path.
+
+| Metric                      | TP8 (fmoe) | EP8 (fmoe)  | Delta          | vs Baseline    |
+|-----------------------------|-----------|-------------|----------------|----------------|
+| Benchmark duration (s)      | 33.08     | 33.84       | +2.3% slower   | ~same          |
+| Total token throughput (tok/s)| 21,250  | 20,774      | -2.2%          | ~same          |
+| Output token throughput (tok/s)| 90.68  | 88.65       | -2.2%          | ~same          |
+| Request throughput (req/s)  | 0.30      | 0.30        | same           | same           |
+| Mean TTFT (ms)              | 3,389     | 3,342       | -1.4% (better) | ~same          |
+| Mean TPOT (ms)              | 98.36     | 101.11      | +2.8% slower   | ~same          |
+| P99 TPOT (ms)               | 101.16    | 103.64      | +2.5%          | ~same          |
+
+**Verdict:** The fmoe patch has **no meaningful impact** on either configuration. This confirms
+that the MoE kernel selection (1-stage vs 2-stage) is not a bottleneck.
+
+### 2.3 Latency Profiling (vllm bench latency, input=4096, output=30, batch=10)
+
+| Config               | Avg Latency (s) | vs TP8 Baseline |
+|----------------------|-----------------|-----------------|
+| TP8 (2-stage, old)   | 3.40            | —               |
+| TP8 (fmoe patch)     | 3.40            | 0%              |
+| EP d-free (2-stage)  | 3.71            | +9.1%           |
+| EP d-free (fmoe)     | 3.70            | +8.8%           |
+
+The fmoe patch changes latency by <0.3% in both configurations — well within noise.
 
 ## 3. Profiling Setup
 
@@ -152,9 +191,70 @@ For a single decode step with batch=10:
 
 All-reduce is 92% of each decode step in EP, and 91% in TP8.
 
-## 6. Key Insights and Recommendations
+## 6. AITER fmoe Experiment: Forcing 1-Stage Fused MoE for Decode
 
-### 6.1 The Fundamental Problem
+### 6.1 Background: 2-Stage vs 1-Stage MoE Kernels
+
+AITER's `get_2stage_cfgs()` function (in `aiter/fused_moe.py`) selects the MoE kernel path:
+
+- **1-stage (fused):** `aiter::fmoe_fp8_blockscale_g1u1` — single kernel launch, handles
+  gate+up+down projections in one shot. Used for prefill (M > 32).
+- **2-stage (CK):** `aiter::ck_moe_stage1` + `aiter::ck_moe_stage2` — two separate Composable
+  Kernel launches for up-projection and down-projection. Used for decode (M <= 32).
+
+The selection logic for FP8 blockscale (DeepSeek R1's quant type):
+```python
+# Original AITER heuristic (aiter/fused_moe.py line 719)
+run_1stage = token > 32 and (inter_dim % 256 == 0)
+```
+
+For decode with batch=10: `token=10 <= 32` → 2-stage CK is chosen.
+
+### 6.2 The Patch
+
+Changed the heuristic to always use fused kernel when `inter_dim` is aligned:
+```python
+# Patched
+run_1stage = (inter_dim % 256 == 0)
+```
+
+This forces `fmoe_fp8_blockscale_g1u1` for ALL token counts, including decode.
+Verified via server logs: `run_1stage = True` for all MoE configurations.
+
+### 6.3 Why It Didn't Help
+
+From the profiling data (Section 4.1), the MoE kernels account for a tiny fraction of GPU time:
+
+| MoE Component             | EP Self CUDA | EP %  | TP8 Self CUDA | TP8 % |
+|---------------------------|-------------|-------|--------------|-------|
+| `ck_moe_stage1` (decode)  | 90ms        | 1.20% | 70ms         | 1.10% |
+| `ck_moe_stage2` (decode)  | 51ms        | 0.67% | 39ms         | 0.62% |
+| `fmoe_fp8_blockscale_g1u1` (prefill) | 55ms | 0.73% | 61ms | 0.95% |
+| `moe_sorting_fwd`         | 20ms        | 0.26% | 20ms         | 0.32% |
+| **Total MoE**             | **216ms**   | **2.86%** | **190ms** | **2.99%** |
+
+Even if the fused kernel were **2x faster** than 2-stage for decode, saving 100% of
+`ck_moe_stage1 + ck_moe_stage2` time (~141ms EP, ~109ms TP8), this would only reduce
+total CUDA time by **1.4-1.9%** — well within benchmark noise.
+
+The all-reduce at **85-87%** of GPU time is the only operation where optimization can yield
+meaningful improvements.
+
+### 6.4 Additional Note: `use_cfg()` Bypass
+
+AITER also bypasses tuned configs for small token counts via `use_cfg()`:
+```python
+if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
+    return False  # use default heuristic, not tuned config
+```
+
+For DeepSeek R1 decode (topk=8, token=10): `10 * 8 = 80 <= 128` → tuned configs are ignored.
+This means even providing a custom `AITER_CONFIG_FMOE` CSV with `run_1stage=1` would be
+bypassed. The only way to force fused MoE is to patch the heuristic directly.
+
+## 7. Key Insights and Recommendations
+
+### 7.1 The Fundamental Problem
 
 The dispatch-free EP approach replaces All-to-All communication with an all-reduce.
 For **intra-node** configurations (all 8 GPUs on the same MI300X node via XGMI), this
@@ -167,7 +267,7 @@ But the all-reduce's **latency cost (~1.2ms)** far exceeds the MoE compute savin
 (~1.1ms faster per layer in fused path, ~1.1ms slower in staged path). The net effect
 is roughly zero — explaining the parity in benchmarks.
 
-### 6.2 When Dispatch-Free EP Could Win
+### 7.2 When Dispatch-Free EP Could Win
 
 Dispatch-free EP would be beneficial when:
 1. **Inter-node EP** (multi-node with slower interconnect): All-to-All over network is
@@ -177,7 +277,7 @@ Dispatch-free EP would be beneficial when:
 3. **Optimized all-reduce**: If the all-reduce latency could be reduced from ~1.2ms to
    ~0.1ms (closer to the bandwidth limit for 143KB), EP would show significant gains.
 
-### 6.3 Optimization Targets (Priority Order)
+### 7.3 Optimization Targets (Priority Order)
 
 1. **Reduce all-reduce latency** (highest impact):
    - Current: ~1.2ms for 143KB payload (latency-bound, not bandwidth-bound)
@@ -199,9 +299,20 @@ Dispatch-free EP would be beneficial when:
    - The CK MoE GEMM is 29% slower for EP shapes (full N=2048 vs TP N=256)
    - Tuning the kernel for the EP shape could recover some of this
 
-## 7. Profiling Commands Used
+### 7.4 Confirmed Non-Bottlenecks
 
-### EP Dispatch-Free:
+- **MoE kernel selection (1-stage vs 2-stage):** Only 2-3% of GPU time. Fmoe experiment
+  confirmed no meaningful impact from forcing fused kernel for decode.
+- **MoE kernel shapes (EP vs TP GEMM dimensions):** 29% slower per-call in EP but only
+  ~1% of total time.
+- **Attention:** Same in both configs, ~0.24% of GPU time.
+- **Quantization/dequantization:** Same in both configs, ~0.8% of GPU time.
+
+## 8. Profiling Commands Used
+
+### Profiling (with --enforce-eager for kernel-level visibility):
+
+EP Dispatch-Free:
 ```bash
 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MOE=1 MORI_SHMEM_HEAP_SIZE=12G \
 VLLM_MORI_EP_DISPATCH_FREE=1 vllm bench latency \
@@ -212,7 +323,7 @@ VLLM_MORI_EP_DISPATCH_FREE=1 vllm bench latency \
   --profile --profiler-config '{"profiler":"torch","torch_profiler_dir":"/tmp/profile_ep"}'
 ```
 
-### TP8 Baseline:
+TP8 Baseline:
 ```bash
 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MOE=1 vllm bench latency \
   --model deepseek-ai/DeepSeek-R1 \
@@ -222,9 +333,19 @@ VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MOE=1 vllm bench latency \
   --profile --profiler-config '{"profiler":"torch","torch_profiler_dir":"/tmp/profile_tp"}'
 ```
 
-## 8. Raw Profiler Output
+### Benchmarking (with CUDA graphs, end-to-end):
 
-### 8.1 EP Dispatch-Free (Rank 0, sorted by self_cuda_time_total)
+```bash
+# EP dispatch-free
+bash benchmarks/kernels/bench_mori_ep_serve_markus.sh --backend dispatch_free --num-runs 2
+
+# TP8 baseline
+bash benchmarks/kernels/bench_mori_ep_serve_markus.sh --backend tp_only --num-runs 2
+```
+
+## 9. Raw Profiler Output
+
+### 9.1 EP Dispatch-Free (Rank 0, sorted by self_cuda_time_total, 2-stage MoE)
 
 ```
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
@@ -253,7 +374,7 @@ Self CPU time total: 7.561s
 Self CUDA time total: 7.549s
 ```
 
-### 8.2 TP8 Baseline (Rank 0, sorted by self_cuda_time_total)
+### 9.2 TP8 Baseline (Rank 0, sorted by self_cuda_time_total, 2-stage MoE)
 
 ```
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
@@ -277,7 +398,7 @@ Self CPU time total: 7.321s
 Self CUDA time total: 6.375s
 ```
 
-## 9. Configuration Details
+## 10. Configuration Details
 
 ### EP Dispatch-Free Server:
 ```
@@ -307,3 +428,10 @@ VLLM_ROCM_USE_AITER_MOE=1
 - Fork: `maeehart/mori` @ commit `ed9e81c`
 - Changes: `shmem_is_initialized()` API, `MoriAllReduceOp`, `combine_only()`
 - vLLM branch: `feat/dispatch-free-mori` @ `maeehart/vllm`
+
+### AITER fmoe Patch (in-place, not committed):
+- File: `/usr/local/lib/python3.12/dist-packages/aiter/fused_moe.py` line 719
+- Original: `run_1stage = token > 32 and (inter_dim % 256 == 0)`
+- Patched: `run_1stage = (inter_dim % 256 == 0)`
+- Effect: Forces fused `fmoe_fp8_blockscale_g1u1` for decode (M<=32) instead of 2-stage CK
+- Result: No meaningful performance change (MoE is <3% of GPU time)
