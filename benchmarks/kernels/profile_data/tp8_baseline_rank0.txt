@@ -1,0 +1,107 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                 execute_context_0(0)_generation_10(10)         0.00%       0.000us         0.00%       0.000us       0.000us        6.239s        97.86%        6.239s     231.067ms            27  
+                               _C_custom_ar::all_reduce         0.20%      14.722ms         0.91%      66.597ms      17.466us        5.436s        85.28%        5.436s       1.426ms          3813  
+void vllm::cross_device_reduce_1stage<__hip_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us        5.293s        83.02%        5.293s       1.434ms          3690  
+                   execute_context_0(0)_generation_9(9)         0.00%       0.000us         0.00%       0.000us       0.000us     471.856ms         7.40%     471.856ms     235.928ms             2  
+                         aiter::gemm_a8w8_blockscale_ck         1.59%     116.123ms         2.59%     189.957ms      19.222us     239.483ms         3.76%     239.483ms      24.234us          9882  
+                execute_context_9(2304)_generation_1(1)         0.00%       0.000us         0.00%       0.000us       0.000us     229.645ms         3.60%     229.645ms     229.645ms             1  
+                   execute_context_0(0)_generation_1(1)         0.00%       0.000us         0.00%       0.000us       0.000us     224.100ms         3.52%     224.100ms     224.100ms             1  
+                 execute_context_1(256)_generation_0(0)         0.00%       0.000us         0.00%       0.000us       0.000us     173.462ms         2.72%     173.462ms     173.462ms             1  
+void vllm::cross_device_reduce_2stage<__hip_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us     129.576ms         2.03%     129.576ms       1.053ms           123  
+void ck::kernel_gemm_xdl_cshuffle_v3<ck::GridwiseGem...         0.00%       0.000us         0.00%       0.000us       0.000us     116.633ms         1.83%     116.633ms      20.228us          5766  
+ncclDevKernel_Generic_2(ncclDevKernelArgsStorage<409...         0.00%       0.000us         0.00%       0.000us       0.000us     104.200ms         1.63%     104.200ms     672.258us           155  
+void ck::kernel_gemm_xdl_cshuffle_v3<ck::GridwiseGem...         0.00%       0.000us         0.00%       0.000us       0.000us      98.870ms         1.55%      98.870ms      52.284us          1891  
+                                       vllm::all_reduce         1.35%      99.067ms         2.56%     187.394ms      47.610us      91.751ms         1.44%        5.528s       1.404ms          3936  
+                                   aiter::ck_moe_stage1         1.10%      80.573ms         4.25%     310.967ms     178.717us      70.089ms         1.10%      70.093ms      40.284us          1740  
+void ck::kernel_moe_gemm<ck::GridwiseMoeGemmBlockSca...         0.00%       0.000us         0.00%       0.000us       0.000us      69.426ms         1.09%      69.426ms      41.276us          1682  
+                        aiter::fmoe_fp8_blockscale_g1u1         0.02%       1.751ms         0.04%       2.665ms      22.978us      60.515ms         0.95%      60.515ms     521.679us           116  
+aiter::fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_3...         0.00%       0.000us         0.00%       0.000us       0.000us      60.515ms         0.95%      60.515ms     521.679us           116  
+                  aiter::dynamic_per_token_scaled_quant         1.88%     137.280ms         3.18%     232.555ms      17.254us      58.524ms         0.92%      58.524ms       4.342us         13478  
+_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF1...         0.00%       0.000us         0.00%       0.000us       0.000us      58.524ms         0.92%      58.524ms       4.342us         13478  
+                                            aten::copy_         0.75%      55.242ms         1.75%     128.201ms      10.492us      52.349ms         0.82%      52.349ms       4.284us         12219  
+                                   aiter::ck_moe_stage2         0.91%      66.511ms         3.44%     251.813ms     144.720us      39.426ms         0.62%      39.426ms      22.659us          1740  
+void ck::kernel_moe_gemm<ck::GridwiseMoeGemmBlockSca...         0.00%       0.000us         0.00%       0.000us       0.000us      39.426ms         0.62%      39.426ms      22.659us          1740  
+                                              aten::mul         0.42%      30.981ms         0.87%      63.329ms       8.111us      35.288ms         0.55%      35.288ms       4.519us          7808  
+                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us      31.507ms         0.49%      31.507ms       3.969us          7939  
+                       aiter::rmsnorm2d_fwd_with_add_ck         0.72%      52.705ms         1.08%      78.869ms      20.202us      29.918ms         0.47%      29.918ms       7.663us          3904  
+_ZN7ck_tile6kentryILi1ENS_12Rmsnorm2dFwdINS_27Rmsnor...         0.00%       0.000us         0.00%       0.000us       0.000us      29.918ms         0.47%      29.918ms       7.663us          3904  
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us      27.601ms         0.43%      27.601ms       4.792us          5760  
+                                              aten::cat         0.52%      37.771ms         1.08%      78.883ms      13.540us      27.564ms         0.43%      27.564ms       4.731us          5826  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us      27.485ms         0.43%      27.485ms       4.743us          5795  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us      26.325ms         0.41%      26.325ms       4.294us          6130  
+                                            aten::fill_         0.37%      27.142ms         0.75%      55.020ms       9.792us      21.918ms         0.34%      21.918ms       3.901us          5619  
+                                 aiter::moe_sorting_fwd         0.39%      28.440ms         0.63%      46.482ms      25.044us      20.131ms         0.32%      20.131ms      10.847us          1856  
+                vllm::unified_mla_attention_with_output        15.13%        1.108s        24.63%        1.803s     923.547us      18.866ms         0.30%      86.603ms      44.366us          1952  
+void at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us      18.004ms         0.28%      18.004ms       4.612us          3904  
+void ck_tile::kentry<2, ck_tile::MoeSortingKernel<ck...         0.00%       0.000us         0.00%       0.000us       0.000us      17.616ms         0.28%      17.616ms      10.473us          1682  
+                                               aten::mm         1.18%      86.044ms         1.47%     107.345ms      58.723us      17.280ms         0.27%      17.280ms       9.453us          1828  
+                                        aiter::rms_norm         0.61%      44.899ms         1.20%      88.178ms      22.403us      17.092ms         0.27%      17.092ms       4.342us          3936  
+                                              aten::add         0.20%      14.303ms         0.40%      29.582ms       7.577us      16.781ms         0.26%      16.781ms       4.298us          3904  
+                       aiter::mla_decode_stage1_asm_fwd         0.44%      32.390ms         0.69%      50.186ms      26.539us      16.671ms         0.26%      16.671ms       8.816us          1891  
+               aiter::mla_a8w8_qh16_qseqlen1_gqaratio16         0.00%       0.000us         0.00%       0.000us       0.000us      16.671ms         0.26%      16.671ms       8.816us          1891  
+                                              aten::neg         0.20%      14.424ms         0.42%      31.003ms       7.941us      15.646ms         0.25%      15.646ms       4.008us          3904  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us      15.646ms         0.25%      15.646ms       4.008us          3904  
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us      15.071ms         0.24%      15.071ms       4.022us          3747  
+Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16...         0.00%       0.000us         0.00%       0.000us       0.000us      12.588ms         0.20%      12.588ms       7.484us          1682  
+                                     record_param_comms         0.05%       3.538ms         0.05%       3.981ms     124.404us      12.449ms         0.20%      12.449ms     389.030us            32  
+                                  nccl:_all_gather_base         0.00%       0.000us         0.00%       0.000us       0.000us      12.449ms         0.20%      12.449ms     389.030us            32  
+void ck::kernel_gemm_xdl_cshuffle_v3<ck::GridwiseGem...         0.00%       0.000us         0.00%       0.000us       0.000us      11.275ms         0.18%      11.275ms       6.271us          1798  
+                                             aten::add_         0.16%      11.770ms         0.30%      22.009ms      11.858us      10.820ms         0.17%      10.820ms       5.830us          1856  
+_batched_gemm_a8w8_a_per_token_group_prequant_w_per_...         0.00%       0.000us         0.00%       0.000us       0.000us      10.575ms         0.17%      10.575ms       5.592us          1891  
+void at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us       9.490ms         0.15%       9.490ms       5.019us          1891  
+                     _C_cache_ops::concat_and_cache_mla         0.08%       5.509ms         0.28%      20.153ms      10.324us       9.269ms         0.15%       9.269ms       4.748us          1952  
+void vllm::concat_and_cache_mla_kernel<__hip_bfloat1...         0.00%       0.000us         0.00%       0.000us       0.000us       9.269ms         0.15%       9.269ms       4.748us          1952  
+_ZN7ck_tile6kentryILi1ENS_12Rmsnorm2dFwdINS_27Rmsnor...         0.00%       0.000us         0.00%       0.000us       0.000us       8.795ms         0.14%       8.795ms       4.506us          1952  
+                        vllm::rocm_aiter_mla_decode_fwd         4.53%     331.788ms         5.58%     408.470ms     216.008us       8.305ms         0.13%      24.976ms      13.208us          1891  
+                                 _fwd_kernel_stage2_asm         0.00%       0.000us         0.00%       0.000us       0.000us       8.305ms         0.13%       8.305ms       4.392us          1891  
+                                       _C::silu_and_mul         0.05%       3.768ms         0.19%      14.067ms       7.206us       8.299ms         0.13%       8.299ms       4.252us          1952  
+_ZN4vllm18act_and_mul_kernelIN3c108BFloat16ETnPFT_RK...         0.00%       0.000us         0.00%       0.000us       0.000us       8.299ms         0.13%       8.299ms       4.252us          1952  
+_batched_gemm_a8w8_a_per_token_group_prequant_w_per_...         0.00%       0.000us         0.00%       0.000us       0.000us       8.290ms         0.13%       8.290ms       4.384us          1891  
+                                            aten::index         0.40%      29.639ms         1.87%     136.630ms      67.773us       8.176ms         0.13%       9.230ms       4.578us          2016  
+_ZN7ck_tile6kentryILi1ENS_12Rmsnorm2dFwdINS_27Rmsnor...         0.00%       0.000us         0.00%       0.000us       0.000us       8.100ms         0.13%       8.100ms       4.150us          1952  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       7.845ms         0.12%       7.845ms       4.227us          1856  
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us       7.802ms         0.12%       7.802ms       3.876us          2013  
+                                    aiter::silu_and_mul         0.24%      17.763ms         0.39%      28.382ms      16.311us       7.741ms         0.12%       7.741ms       4.449us          1740  
+_ZN5aiter18act_and_mul_kernelIfDF16bTnPFfRKT_EXadL_Z...         0.00%       0.000us         0.00%       0.000us       0.000us       7.741ms         0.12%       7.741ms       4.449us          1740  
+void at::native::vectorized_gather_kernel<16, long>(...         0.00%       0.000us         0.00%       0.000us       0.000us       7.696ms         0.12%       7.696ms       4.002us          1923  
+                         aiter::static_per_tensor_quant         0.28%      20.188ms         0.42%      30.776ms      16.275us       7.680ms         0.12%       7.680ms       4.061us          1891  
+_ZN5aiter19scaled_quant_kernelIDF16bDB8_EEvPT0_PKT_P...         0.00%       0.000us         0.00%       0.000us       0.000us       7.680ms         0.12%       7.680ms       4.061us          1891  
+                         aiter::biased_grouped_topk_hip         0.29%      21.293ms         0.44%      32.024ms      17.254us       7.675ms         0.12%       7.675ms       4.135us          1856  
+void aiter::grouped_topk_opt_sort_kernel<c10::BFloat...         0.00%       0.000us         0.00%       0.000us       0.000us       7.675ms         0.12%       7.675ms       4.135us          1856  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       6.784ms         0.11%       6.784ms       3.899us          1740  
+void ck::kernel_gemm_xdl_cshuffle_v3<ck::GridwiseGem...         0.00%       0.000us         0.00%       0.000us       0.000us       5.267ms         0.08%       5.267ms      28.315us           186  
+void ck::kernel_gemm_xdl_cshuffle_v3<ck::GridwiseGem...         0.00%       0.000us         0.00%       0.000us       0.000us       3.799ms         0.06%       3.799ms      31.141us           122  
+void ck::kernel_gemm_xdl_cshuffle_v3<ck::GridwiseGem...         0.00%       0.000us         0.00%       0.000us       0.000us       3.070ms         0.05%       3.070ms      50.330us            61  
+                              aiter::fmha_v3_varlen_fwd         0.04%       2.859ms         0.06%       4.646ms      38.079us       2.485ms         0.04%       2.485ms      20.366us           122  
+       aiter::fmha_fwd_hd192x128_bf16_causal_rtna_group         0.00%       0.000us         0.00%       0.000us       0.000us       2.485ms         0.04%       2.485ms      20.366us           122  
+Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64...         0.00%       0.000us         0.00%       0.000us       0.000us       2.010ms         0.03%       2.010ms      34.656us            58  
+Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT192x1...         0.00%       0.000us         0.00%       0.000us       0.000us       2.007ms         0.03%       2.007ms      66.909us            30  
+                                    hipEventSynchronize         1.45%     106.008ms         1.53%     111.730ms       1.693ms       1.609ms         0.03%       4.298ms      65.116us            66  
+                                           aten::argmax         0.01%     526.221us         0.01%     809.087us      24.518us       1.594ms         0.03%       1.594ms      48.316us            33  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       1.594ms         0.03%       1.594ms      49.825us            32  
+                                         aten::_softmax         0.00%     307.353us         0.01%     640.097us      20.003us       1.531ms         0.02%       1.531ms      47.840us            32  
+void at::native::(anonymous namespace)::cunn_SoftMax...         0.00%       0.000us         0.00%       0.000us       0.000us       1.531ms         0.02%       1.531ms      47.840us            32  
+                                          aten::nonzero         0.02%       1.162ms         1.14%      83.485ms       2.693ms     886.100us         0.01%     886.100us      28.584us            31  
+void ck_tile::kentry<2, ck_tile::MoeSortingMultiPhas...         0.00%       0.000us         0.00%       0.000us       0.000us     789.914us         0.01%     789.914us      13.619us            58  
+Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x32...         0.00%       0.000us         0.00%       0.000us       0.000us     674.862us         0.01%     674.862us      11.636us            58  
+void ck::kernel_moe_gemm<ck::GridwiseMoeGemmBlockSca...         0.00%       0.000us         0.00%       0.000us       0.000us     662.688us         0.01%     662.688us      11.426us            58  
+void ck::kernel_gemm_xdl_cshuffle_v3<ck::GridwiseGem...         0.00%       0.000us         0.00%       0.000us       0.000us     568.864us         0.01%     568.864us       9.808us            58  
+                                             aten::div_         0.01%     471.502us         0.01%     907.974us      14.187us     558.286us         0.01%     558.286us       8.723us            64  
+void ck_tile::kentry<2, ck_tile::MoeSortingKernel<ck...         0.00%       0.000us         0.00%       0.000us       0.000us     447.767us         0.01%     447.767us       7.720us            58  
+                                      _rocm_C::wvSplitK         0.00%     232.169us         0.01%     873.026us      14.550us     396.369us         0.01%     396.369us       6.606us            60  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     300.936us         0.00%     300.936us       9.404us            32  
+void wvSplitK_hf_sml_<__hip_bfloat16, 64, 1, 16, 8, ...         0.00%       0.000us         0.00%       0.000us       0.000us     293.579us         0.00%     293.579us       5.062us            58  
+                                     aten::index_select         0.01%     643.228us         0.02%       1.145ms      17.898us     288.077us         0.00%     309.868us       4.842us            64  
+void at::native::(anonymous namespace)::indexSelectS...         0.00%       0.000us         0.00%       0.000us       0.000us     288.077us         0.00%     288.077us       9.603us            30  
+void ck_tile::kentry<2, ck_tile::MoeSortingMultiPhas...         0.00%       0.000us         0.00%       0.000us       0.000us     275.510us         0.00%     275.510us       4.750us            58  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     273.225us         0.00%     273.225us       4.337us            63  
+void rocprim::ROCPRIM_400200_NS::detail::trampoline_...         0.00%       0.000us         0.00%       0.000us       0.000us     268.364us         0.00%     268.364us       8.657us            31  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     257.350us         0.00%     257.350us       8.042us            32  
+void ck_tile::kentry<2, ck_tile::MoeSortingMultiPhas...         0.00%       0.000us         0.00%       0.000us       0.000us     255.325us         0.00%     255.325us       4.402us            58  
+void ck_tile::kentry<2, ck_tile::MoeSortingClearWork...         0.00%       0.000us         0.00%       0.000us       0.000us     253.551us         0.00%     253.551us       4.372us            58  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 7.321s
+Self CUDA time total: 6.375s
+
