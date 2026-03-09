@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """FlyDSL MXFP4 MoE integration for vLLM.
 
-Properly dequantizes MXFP4 (applying MX block scales), then requantizes
-with FlyDSL's expected format. This preserves numeric accuracy.
+Directly preshuffles stored MXFP4 weight bytes and original E8M0 scales
+for FlyDSL's kernel layout. No dequant/requant -- pure byte permutation.
 """
 import functools
 import glob
@@ -54,35 +54,6 @@ def _compile_stage2(model_dim, inter_dim, experts, topk, tile_n):
     )
 
 
-def _mxfp4_dequant_with_scales(w_fp4_uint8, scales_uint8, block_size=32):
-    """Properly dequantize MXFP4: apply per-block E8M0 scales.
-
-    w_fp4_uint8: [*, K_packed] uint8 (2 fp4 values per byte)
-    scales_uint8: [*, K//32] uint8 (E8M0 format)
-    Returns: [*, K] float32
-    """
-    from tests.kernels.utils import fp4_utils
-
-    # Unpack fp4 nibbles to float32 values in [-6, 6]
-    raw_fp32 = fp4_utils.mxfp4_to_f32(w_fp4_uint8)
-
-    # Convert E8M0 scales to float32: scale = 2^(e8m0 - 127)
-    E8M0_BIAS = 127
-    scale_int = scales_uint8.to(torch.int32)
-    scale_f32 = torch.pow(2.0, (scale_int.float() - E8M0_BIAS))
-
-    # Apply scales: each scale covers block_size consecutive elements
-    # raw_fp32: [*, K], scale_f32: [*, K//32]
-    # Expand scale to match: repeat each scale for block_size elements
-    scale_expanded = scale_f32.repeat_interleave(block_size, dim=-1)
-
-    # Trim to match K (in case K is not multiple of block_size)
-    K = raw_fp32.shape[-1]
-    scale_expanded = scale_expanded[..., :K]
-
-    return raw_fp32 * scale_expanded
-
-
 def _load_original_scales(layer_idx, proj_name, E, device):
     """Load original per-block MX scales from safetensors."""
     key = (layer_idx, proj_name)
@@ -97,24 +68,23 @@ def _load_original_scales(layer_idx, proj_name, E, device):
     for path in paths:
         with safe_open(path, framework="pt") as f:
             for skey in f.keys():
-                if f"layers.{layer_idx}.mlp.experts." in skey and proj_name in skey and "weight_scale" in skey:
+                if (f"layers.{layer_idx}.mlp.experts." in skey
+                    and proj_name in skey and "weight_scale" in skey):
                     scales.append((skey, f.get_tensor(skey).to(device)))
         if len(scales) >= E:
             break
 
-    if len(scales) < E:
-        logger.warning("Only found %d/%d scales for layer %d %s", len(scales), E, layer_idx, proj_name)
-        return None
-
-    # Sort by expert index
     scales.sort(key=lambda x: int(x[0].split("experts.")[1].split(".")[0]))
     result = torch.stack([s[1] for s in scales[:E]])
     _original_scales[key] = result
     return result
 
 
-def _convert_weights(w_data, padded_K, padded_N, E, layer_idx, proj_name, device):
-    """Dequant with proper MX scales, then requant for FlyDSL. Cached."""
+def _convert_weights(w_data, padded_K, padded_N, E, layer_idx, proj_name, is_gate_up, device):
+    """Preshuffle stored MXFP4 weights + original scales. No dequant/requant.
+
+    Pure byte permutation matching FlyDSL's MFMA lane access pattern.
+    """
     cache_key = id(w_data)
     if cache_key in _weight_cache:
         return _weight_cache[cache_key]
@@ -122,51 +92,53 @@ def _convert_weights(w_data, padded_K, padded_N, E, layer_idx, proj_name, device
     from tests.kernels.utils import fp4_utils
 
     _, K_packed, N = w_data.shape
+    actual_K_scale = K_packed * 2 // 32  # K//32
 
-    # Row-major weights
-    w_row = w_data.permute(0, 2, 1).contiguous()  # [E, N, K_packed]
+    # Weights: col-major [E, K_packed, N] -> row-major [E, N, K_packed], view as fp4x2
+    w_fp4 = w_data.permute(0, 2, 1).contiguous().view(torch.float4_e2m1fn_x2)
 
-    # Load original scales
+    # Load original scales: [E, N_orig, K_scale_orig]
     orig_scales = _load_original_scales(layer_idx, proj_name, E, device)
-    if orig_scales is not None:
-        # orig_scales: [E, N_orig, K//32] where N_orig may differ from N (vLLM pads N)
-        N_orig = orig_scales.shape[1]
-        K_scale_orig = orig_scales.shape[2]
+    N_orig = orig_scales.shape[1]
+    K_scale_orig = orig_scales.shape[2]
+    s_e8m0 = orig_scales.view(fp4_utils.fp8_e8m0)
 
-        # Properly dequantize: fp4_value * mx_scale
-        # Only dequant the original (unpadded) portion
-        w_orig = w_row[:, :N_orig, :K_scale_orig * 16]  # K_packed for original K
-        w_fp32 = _mxfp4_dequant_with_scales(w_orig, orig_scales)
-        logger.info("Proper dequant: %s -> %s min=%.2f max=%.2f",
-                    list(w_orig.shape), list(w_fp32.shape), w_fp32.min(), w_fp32.max())
-    else:
-        # Fallback: dequant without scales (lossy)
-        w_fp32 = fp4_utils.mxfp4_to_f32(w_row)
-        logger.warning("Using lossy dequant (no original scales found)")
+    target_K_packed = padded_K // 2
+    target_K_scale = padded_K // 32
 
-    # Pad to target dimensions
-    full_K = padded_K
-    if w_fp32.shape[-1] < full_K:
-        w_fp32 = torch.cat([w_fp32,
-            torch.zeros(E, w_fp32.shape[1], full_K - w_fp32.shape[-1],
-                       dtype=torch.float32, device=device)], dim=-1)
-    if w_fp32.shape[1] < padded_N:
-        w_fp32 = torch.cat([w_fp32,
-            torch.zeros(E, padded_N - w_fp32.shape[1], full_K,
-                       dtype=torch.float32, device=device)], dim=1)
+    # Pad K (weights)
+    if target_K_packed > K_packed:
+        w_fp4 = torch.cat([w_fp4,
+            torch.zeros(E, N, target_K_packed - K_packed, dtype=torch.uint8,
+                       device=device).view(torch.float4_e2m1fn_x2)], dim=-1)
+    # Pad K (scales)
+    if target_K_scale > K_scale_orig:
+        s_e8m0 = torch.cat([s_e8m0,
+            torch.zeros(E, N_orig, target_K_scale - K_scale_orig, dtype=torch.uint8,
+                       device=device).view(fp4_utils.fp8_e8m0)], dim=-1)
 
-    # Requantize with FlyDSL format
-    w_q, w_scale, _ = fp4_utils.per_1x32_f4_quant(w_fp32)
-    del w_fp32
-    torch.cuda.empty_cache()
+    # Pad N (weights -- vLLM may have already padded, so check)
+    if padded_N > N:
+        w_fp4 = torch.cat([w_fp4,
+            torch.zeros(E, padded_N - N, target_K_packed, dtype=torch.uint8,
+                       device=device).view(torch.float4_e2m1fn_x2)], dim=1)
+    # Pad N (scales -- original is always unpadded)
+    if padded_N > N_orig:
+        s_e8m0 = torch.cat([s_e8m0,
+            torch.zeros(E, padded_N - N_orig, target_K_scale, dtype=torch.uint8,
+                       device=device).view(fp4_utils.fp8_e8m0)], dim=1)
 
-    w_shuffled = fp4_utils.shuffle_weight_w4(w_q, 16, True, True)
-    w_scale_shuffled = fp4_utils.shuffle_scale_w4(w_scale, E, True)
+    # Preshuffle weights (pure byte permutation)
+    w_shuf = fp4_utils.shuffle_weight_w4(w_fp4, 16, is_gate_up, True)
 
-    result = (w_shuffled, w_scale_shuffled)
+    # Preshuffle scales: flatten to [E*padded_N, target_K_scale] then shuffle
+    s_flat = s_e8m0.reshape(E * padded_N, target_K_scale).contiguous()
+    s_shuf = fp4_utils.shuffle_scale_w4(s_flat, E, is_gate_up)
+
+    result = (w_shuf, s_shuf)
     _weight_cache[cache_key] = result
-    logger.info("FlyDSL weight done: E=%d [%d,%d]->[%d,%d]",
-                E, N, K_packed*2, padded_N, padded_K)
+    logger.info("FlyDSL preshuffle done (no dequant): E=%d N=%d->%d K=%d->%d",
+                E, N_orig, padded_N, K_packed * 2, padded_K)
     return result
 
 
@@ -229,11 +201,11 @@ def flydsl_mxfp4_w4a8_experts(
     x_fp8 = downcast_to_static_fp8(hidden_padded, x_scale)
     a_scale = torch.ones([M, padded_K // 32], dtype=fp4_utils.fp8_e8m0, device=device)
 
-    # Convert weights (with proper MX scale application)
+    # Convert weights (direct preshuffle, no dequant)
     w1_kernel, w1_scale = _convert_weights(
-        w1_data, padded_K, padded_N_w1, E, layer_idx, "gate_up_proj", device)
+        w1_data, padded_K, padded_N_w1, E, layer_idx, "gate_up_proj", True, device)
     w2_kernel, w2_scale = _convert_weights(
-        w2_data, inter_dim_padded, padded_N_w2, E, layer_idx, "down_proj", device)
+        w2_data, inter_dim_padded, padded_N_w2, E, layer_idx, "down_proj", False, device)
 
     # Stage 1
     stage1 = _compile_stage1(padded_K, inter_dim_padded, E, topk, _TILE_N)
