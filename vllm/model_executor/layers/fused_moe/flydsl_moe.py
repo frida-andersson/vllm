@@ -48,7 +48,7 @@ def _compile_stage2(model_dim, inter_dim, experts, topk, tile_n):
         tile_m=_TILE_M, tile_n=tile_n, tile_k=_TILE_K,
         doweight_stage2=False,
         x_dtype="fp8", w_dtype="fp4", out_dtype="f16",
-        use_cshuffle_epilog=False,
+        use_cshuffle_epilog=True,
     )
 
 
