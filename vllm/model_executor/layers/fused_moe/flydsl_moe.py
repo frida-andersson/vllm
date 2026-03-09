@@ -58,36 +58,42 @@ def _compile_stage2(model_dim, inter_dim, experts, topk):
     )
 
 
-def _convert_weights(w_data, actual_K, padded_K):
+def _convert_weights(w_data, actual_K, padded_K, padded_N):
     """Convert vLLM MXFP4 weights to FlyDSL preshuffle format. Cached."""
     cache_key = id(w_data)
     if cache_key in _weight_cache:
         return _weight_cache[cache_key]
 
-    from tests.utils import shuffle_weight
     from tests.kernels.utils import fp4_utils
 
     E, K_packed, N = w_data.shape
 
-    w_row = w_data.permute(0, 2, 1).contiguous()
+    w_row = w_data.permute(0, 2, 1).contiguous()  # [E, N, K_packed]
 
+    # Pad K: K_packed -> padded_K // 2
     padded_K_packed = padded_K // 2
     if padded_K_packed > K_packed:
-        pad = torch.zeros(E, N, padded_K_packed - K_packed,
-                         dtype=torch.uint8, device=w_data.device)
-        w_row = torch.cat([w_row, pad], dim=-1)
+        w_row = torch.cat([w_row, torch.zeros(E, N, padded_K_packed - K_packed,
+                          dtype=torch.uint8, device=w_data.device)], dim=-1)
 
+    # Pad N
+    if padded_N > N:
+        w_row = torch.cat([w_row, torch.zeros(E, padded_N - N, padded_K_packed,
+                          dtype=torch.uint8, device=w_data.device)], dim=1)
+
+    # Dequantize MXFP4 -> FP32 -> re-quantize with FlyDSL's preshuffle format
     w_fp32 = fp4_utils.mxfp4_to_f32(w_row)
     w_q, w_scale, _ = fp4_utils.per_1x32_f4_quant(w_fp32)
-
     w_shuffled = fp4_utils.shuffle_weight_w4(w_q, 16, True, True)
-    w_flat = w_shuffled.view(E * N, padded_K_packed).contiguous()
-    w_scale_flat = w_scale.view(E * N, -1).contiguous()
+
+    # Flatten: [E, padded_N, padded_K_packed] -> [E*padded_N, padded_K]
+    w_flat = w_shuffled.view(E * padded_N, padded_K).contiguous()
+    w_scale_flat = w_scale.view(E * padded_N, -1).contiguous()
 
     result = (w_flat, w_scale_flat)
     _weight_cache[cache_key] = result
-    logger.info("FlyDSL weight conversion done: E=%d N=%d K=%d->%d",
-                E, N, actual_K, padded_K)
+    logger.info("FlyDSL weight conversion done: E=%d N=%d->%d K=%d->%d",
+                E, N, padded_N, actual_K, padded_K)
     return result
 
 
@@ -155,10 +161,14 @@ def flydsl_mxfp4_w4a8_experts(
     a_scale = torch.ones([M, padded_K // 32], dtype=fp4_utils.fp8_e8m0,
                          device=hidden_states.device)
 
-    w1_flat, w1_scale = _convert_weights(w1_data, actual_K, padded_K)
-    w2_flat, w2_scale = _convert_weights(w2_data, actual_K, padded_K)
+    inter_dim_padded = _pad_dim(N_w1 // 2)  # 2880 -> 3072
+    padded_N_w1 = 2 * inter_dim_padded     # 6144 (gate+up combined)
+    padded_N_w2 = padded_K                 # 3072 (model_dim)
 
-    inter_dim_padded = _pad_dim(N_w1 // 2)
+    # w1: [E, K_packed_model, N_w1] -> K=model_dim, N=2*inter_dim
+    w1_flat, w1_scale = _convert_weights(w1_data, actual_K, padded_K, padded_N_w1)
+    # w2: [E, K_packed_inter, N_w2] -> K=inter_dim, N=model_dim
+    w2_flat, w2_scale = _convert_weights(w2_data, actual_K, inter_dim_padded, padded_N_w2)
     stage1 = _compile_stage1(padded_K, inter_dim_padded, E, topk)
 
     out1 = torch.empty(sorted_size, inter_dim_padded, dtype=torch.float16,
