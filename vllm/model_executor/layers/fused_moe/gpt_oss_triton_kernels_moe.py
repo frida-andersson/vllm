@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -26,6 +27,17 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_triton_kernels
 
 logger = init_logger(__name__)
+
+USE_CK_MOE = os.environ.get("VLLM_USE_CK_MOE", "0") == "1"
+if USE_CK_MOE:
+    try:
+        from vllm.model_executor.layers.fused_moe.ck_moe_padded import (
+            ck_mxfp4_w4a8_experts,
+        )
+        logger.info("CK MoE with padding loaded successfully")
+    except ImportError as e:
+        logger.warning("CK MoE import failed: %s. Falling back to Triton.", e)
+        USE_CK_MOE = False
 
 use_legacy_triton_kernels = False
 
@@ -189,6 +201,20 @@ def triton_kernel_moe_forward(
         and quant_config.use_mxfp4_w4a8
         and rocm_aiter_ops.is_enabled()
     ):
+        if USE_CK_MOE:
+            return ck_mxfp4_w4a8_experts(
+                hidden_states, w1, w2,
+                gating_output, topk, renormalize,
+                quant_config=quant_config,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                unpadded_N_w1=unpadded_N_w1,
+                unpadded_K_w1=unpadded_K_w1,
+                unpadded_N_w2=unpadded_N_w2,
+                unpadded_K_w2=unpadded_K_w2,
+            )
+
         from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
 
         routing_data, gather_idx, scatter_idx = aiter_routing(
