@@ -83,8 +83,10 @@ def _convert_weights(w_data, actual_K, padded_K, actual_N, padded_N, E):
 
     # Dequantize -> requantize to get FlyDSL-compatible fp4x2 + scales
     w_fp32 = fp4_utils.mxfp4_to_f32(w_row)
+    del w_row
     w_q, w_scale, _ = fp4_utils.per_1x32_f4_quant(w_fp32)
-    del w_fp32  # free 9.7GB intermediate
+    del w_fp32
+    torch.cuda.empty_cache()
 
     # Preshuffle weights (stays 3D, NOT flattened)
     w_shuffled = fp4_utils.shuffle_weight_w4(w_q, 16, True, True)
