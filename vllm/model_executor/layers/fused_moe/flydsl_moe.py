@@ -64,6 +64,8 @@ def _convert_weights(w_data, actual_K, padded_K, actual_N, padded_N, E):
     from tests.kernels.utils import fp4_utils
 
     _, K_packed, N = w_data.shape
+    logger.info("_convert_weights: E=%d K_packed=%d N=%d shape=%s stride=%s dtype=%s",
+                E, K_packed, N, list(w_data.shape), w_data.stride(), w_data.dtype)
 
     # Convert col-major [E, K_packed, N] to row-major [E, N, K_packed]
     w_row = w_data.permute(0, 2, 1).contiguous()
