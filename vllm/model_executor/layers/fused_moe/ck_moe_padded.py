@@ -38,7 +38,7 @@ def _pad_weights_and_scales(w_data, w_scale_data, actual_K, padded_K):
     # Pad weight K dimension (col-major: [E, K_packed, N])
     if padded_K_packed > actual_K_packed:
         pad_w = torch.zeros(E, padded_K_packed - actual_K_packed, N,
-                           dtype=w_data.dtype, device=w_data.device)
+                           dtype=torch.uint8, device=w_data.device).view(w_data.dtype)
         w_padded = torch.cat([w_data, pad_w], dim=1)
     else:
         w_padded = w_data
@@ -46,7 +46,7 @@ def _pad_weights_and_scales(w_data, w_scale_data, actual_K, padded_K):
     # Pad scale K dimension (col-major: [E, K_scale, N])
     if padded_K_scale > K_scale:
         pad_s = torch.zeros(E, padded_K_scale - K_scale, N,
-                           dtype=w_scale_data.dtype, device=w_scale_data.device)
+                           dtype=torch.uint8, device=w_scale_data.device).view(w_scale_data.dtype)
         s_padded = torch.cat([w_scale_data, pad_s], dim=1)
     else:
         s_padded = w_scale_data
@@ -89,6 +89,15 @@ def ck_mxfp4_w4a8_experts(
     w1_scale = quant_config.w1_precision.weight_scale.storage.data
     w2_scale = quant_config.w2_precision.weight_scale.storage.data
     E = w1_data.shape[0]
+
+    # The CK kernel needs actual K//32 scale format, not CDNA4-swizzled.
+    # vLLM's scales might already be processed. We pass them through and
+    # let the CK kernel handle the format -- it uses QuantType.per_1x32.
+    # But the weights must be viewed as fp4x2, not uint8.
+    if w1_data.dtype == torch.uint8:
+        w1_data = w1_data.view(torch.float4_e2m1fn_x2)
+    if w2_data.dtype == torch.uint8:
+        w2_data = w2_data.view(torch.float4_e2m1fn_x2)
 
     # Pad hidden_states: [M, actual_K] -> [M, padded_K]
     if padded_K > actual_K:
