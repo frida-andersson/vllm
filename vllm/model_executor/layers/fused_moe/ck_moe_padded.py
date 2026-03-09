@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CK/AITER 2-stage MoE with dimension padding for gpt-oss-120b.
+"""CK/AITER 1-stage MoE with K-padding for gpt-oss-120b MXFP4.
 
-Pads K from 2880 to 3072 so K//32=96 passes AITER's assertion.
-Uses original safetensors scales instead of CDNA4-swizzled vLLM scales.
+Passes weights in SAME col-major format as Triton (no transpose!).
+Overrides get_inter_dim to handle col-major shapes correctly.
 """
 import glob
 import logging
@@ -11,9 +11,9 @@ import torch
 logger = logging.getLogger(__name__)
 
 _PAD_MULTIPLE = 128
-_cache: dict = {}  # cached (w_padded, s_padded) by tensor id
-_scale_cache: dict = {}  # cached original scales by (layer_idx, proj_name)
-_layer_counter = 0
+_cache: dict = {}
+_scale_cache: dict = {}
+_patched = False
 
 
 def _pad_dim(x: int) -> int:
@@ -23,72 +23,36 @@ def _pad_dim(x: int) -> int:
     return target
 
 
-def _load_scales(layer_idx, proj_name, E, device):
-    key = (layer_idx, proj_name)
-    if key in _scale_cache:
-        return _scale_cache[key]
+def _patch_get_inter_dim():
+    """Override get_inter_dim to handle col-major [E, K_packed, N] weights."""
+    global _patched
+    if _patched:
+        return
+    _patched = True
 
-    from safetensors import safe_open
-    paths = sorted(glob.glob(
-        "/root/.cache/huggingface/hub/models--amd--gpt-oss-120b*/snapshots/*/*.safetensors"))
-    scales = []
-    for path in paths:
-        with safe_open(path, framework="pt") as f:
-            for skey in f.keys():
-                if (f"layers.{layer_idx}.mlp.experts." in skey
-                    and proj_name in skey and "weight_scale" in skey):
-                    scales.append((skey, f.get_tensor(skey).to(device)))
-        if len(scales) >= E:
-            break
-    scales.sort(key=lambda x: int(x[0].split("experts.")[1].split(".")[0]))
-    result = torch.stack([s[1] for s in scales[:E]])
-    _scale_cache[key] = result
-    logger.info("Loaded original scales: layer=%d proj=%s shape=%s", layer_idx, proj_name, list(result.shape))
-    return result
+    import aiter.fused_moe as fm
+    _orig = fm.get_inter_dim.__wrapped__ if hasattr(fm.get_inter_dim, '__wrapped__') else fm.get_inter_dim
 
+    import functools
 
-def _get_padded(w_data, layer_idx, proj_name, padded_K, device):
-    """Get padded weight + original scale. Cached."""
-    ckey = id(w_data)
-    if ckey in _cache:
-        return _cache[ckey]
+    @functools.lru_cache(maxsize=2048)
+    def patched_get_inter_dim(w1_shape, w2_shape):
+        # Col-major: w1=[E, K_packed, 2*inter_dim], w2=[E, K_packed, model_dim]
+        # K_packed stores 2 fp4 values per element
+        E = w1_shape[0]
+        K_packed = w1_shape[1]
+        N_w1 = w1_shape[2]  # 2 * inter_dim
+        N_w2 = w2_shape[2]  # model_dim
 
-    E, K_packed, N = w_data.shape
-    padded_K_packed = padded_K // 2
-    padded_K_scale = padded_K // 32
+        model_dim = N_w2
+        inter_dim = N_w1 // 2
 
-    # Weight: col-major [E, K_packed, N] -> row-major [E, N, K_packed]
-    w_fp4 = w_data.view(torch.float4_e2m1fn_x2) if w_data.dtype == torch.uint8 else w_data
-    w_row = w_fp4.permute(0, 2, 1).contiguous()
+        logger.info("patched get_inter_dim: E=%d model_dim=%d inter_dim=%d (col-major)",
+                    E, model_dim, inter_dim)
+        return E, model_dim, inter_dim
 
-    # Pad weight K
-    if padded_K_packed > K_packed:
-        pad = torch.zeros(E, N, padded_K_packed - K_packed,
-                         dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2)
-        w_row = torch.cat([w_row, pad], dim=-1)
-
-    # Load original scales: [E, N_orig, K//32]
-    s_orig = _load_scales(layer_idx, proj_name, E, device)
-    N_orig = s_orig.shape[1]
-    K_scale_orig = s_orig.shape[2]
-
-    # Pad scale K
-    if padded_K_scale > K_scale_orig:
-        pad = torch.zeros(E, N_orig, padded_K_scale - K_scale_orig,
-                         dtype=s_orig.dtype, device=device)
-        s_orig = torch.cat([s_orig, pad], dim=-1)
-
-    # Pad scale N (original is unpadded, weight N may be padded by vLLM)
-    if N > N_orig:
-        pad = torch.zeros(E, N - N_orig, padded_K_scale,
-                         dtype=s_orig.dtype, device=device)
-        s_orig = torch.cat([s_orig, pad], dim=1)
-
-    result = (w_row, s_orig)
-    _cache[ckey] = result
-    logger.info("CK MoE cached: E=%d N=%d K=%d->%d scale=%s",
-                E, N, K_packed*2, padded_K, list(s_orig.shape))
-    return result
+    fm.get_inter_dim = patched_get_inter_dim
+    logger.info("Patched get_inter_dim for col-major weights")
 
 
 def ck_mxfp4_w4a8_experts(
@@ -98,10 +62,11 @@ def ck_mxfp4_w4a8_experts(
     unpadded_N_w1=None, unpadded_K_w1=None,
     unpadded_N_w2=None, unpadded_K_w2=None,
 ):
-    global _layer_counter
     import aiter
     from aiter import QuantType, ActivationType
     from aiter.fused_moe import fused_moe_1stage, moe_sorting
+
+    _patch_get_inter_dim()
 
     assert quant_config is not None
     M = hidden_states.shape[0]
@@ -109,26 +74,23 @@ def ck_mxfp4_w4a8_experts(
     padded_K = _pad_dim(actual_K)
     device = hidden_states.device
 
+    # Get weight and scale tensors AS-IS (col-major, same as Triton receives)
     w1_data = w1.storage.data if hasattr(w1, 'storage') else w1
     w2_data = w2.storage.data if hasattr(w2, 'storage') else w2
-    E = w1_data.shape[0]
-
-    # Determine layer index for scale loading
-    layer_idx = _layer_counter % 36
-    if id(w1_data) not in _cache:
-        _layer_counter += 1
-        layer_idx = (_layer_counter - 1) % 36
-
-    # Get padded weights (cached) + use vLLM's processed scales directly
-    w1_row, _ = _get_padded(w1_data, layer_idx, "gate_up_proj", padded_K, device)
-    w2_row, _ = _get_padded(w2_data, layer_idx, "down_proj", padded_K, device)
-
-    # Use vLLM's CDNA4-swizzled scales AS-IS -- the fmoe_g1u1 kernel expects
-    # this format (it does w1_scale.view(E, -1) internally).
     w1_scale = quant_config.w1_precision.weight_scale.storage.data.contiguous()
     w2_scale = quant_config.w2_precision.weight_scale.storage.data.contiguous()
+    E = w1_data.shape[0]
 
-    # Pad hidden_states
+    # View as fp4x2 if uint8
+    if w1_data.dtype == torch.uint8:
+        w1_data = w1_data.view(torch.float4_e2m1fn_x2)
+    if w2_data.dtype == torch.uint8:
+        w2_data = w2_data.view(torch.float4_e2m1fn_x2)
+
+    # NO transpose -- pass col-major [E, K_packed, N] directly
+    # The CK kernel should handle this the same way Triton does
+
+    # Pad hidden_states if needed
     if padded_K > actual_K:
         hidden_padded = torch.zeros(M, padded_K, dtype=hidden_states.dtype, device=device)
         hidden_padded[:, :actual_K] = hidden_states
@@ -137,9 +99,15 @@ def ck_mxfp4_w4a8_experts(
 
     # Routing
     sm_first = not renormalize
-    logits = torch.softmax(gating_output.float(), dim=-1) if sm_first else gating_output.float()
+    if sm_first:
+        logits = torch.softmax(gating_output.float(), dim=-1)
+    else:
+        logits = gating_output.float()
     topk_vals, topk_ids = torch.topk(logits, k=topk, dim=-1)
-    topk_weights = topk_vals if sm_first else torch.softmax(topk_vals, dim=-1)
+    if not sm_first:
+        topk_weights = torch.softmax(topk_vals, dim=-1)
+    else:
+        topk_weights = topk_vals
     topk_weights = topk_weights.to(torch.float32)
     topk_ids = topk_ids.to(torch.int32)
 
@@ -147,13 +115,11 @@ def ck_mxfp4_w4a8_experts(
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, E, block_m, None)
 
-    moe_out = torch.empty(M, padded_K, dtype=hidden_states.dtype, device=device)
+    moe_out = torch.empty(M, actual_K, dtype=hidden_states.dtype, device=device)
 
-    # Use 1-stage kernel (fmoe_g1u1) -- the 2-stage CK path has correctness
-    # issues for per_1x32 MXFP4. The 1-stage path calls aiter.fmoe_g1u1 directly.
     fused_moe_1stage(
         hidden_states=hidden_padded,
-        w1=w1_row, w2=w2_row,
+        w1=w1_data, w2=w2_data,
         topk=topk,
         sorted_ids=sorted_ids,
         sorted_weights=sorted_weights,
@@ -170,4 +136,4 @@ def ck_mxfp4_w4a8_experts(
         w2_scale=w2_scale,
     )
 
-    return moe_out[:, :actual_K]
+    return moe_out
