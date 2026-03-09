@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -26,6 +27,31 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_triton_kernels
 
 logger = init_logger(__name__)
+
+USE_FLYDSL_MOE = os.environ.get("VLLM_USE_FLYDSL_MOE", "0") == "1"
+if USE_FLYDSL_MOE:
+    try:
+        from vllm.model_executor.layers.fused_moe.flydsl_moe import (
+            flydsl_mxfp4_w4a8_experts,
+        )
+        logger.info("FlyDSL MoE kernels loaded successfully")
+    except ImportError as e:
+        logger.warning("FlyDSL MoE import failed: %s. Falling back to Triton.", e)
+        USE_FLYDSL_MOE = False
+
+# FlyDSL MoE integration: use MLIR-compiled kernels instead of Triton
+# Enable with VLLM_USE_FLYDSL_MOE=1
+USE_FLYDSL_MOE = os.environ.get("VLLM_USE_FLYDSL_MOE", "0") == "1"
+
+if USE_FLYDSL_MOE:
+    try:
+        from vllm.model_executor.layers.fused_moe.flydsl_moe import (
+            flydsl_mxfp4_w4a8_experts,
+        )
+        logger.info("FlyDSL MoE kernels loaded successfully")
+    except ImportError as e:
+        logger.warning("FlyDSL MoE import failed: %s. Falling back to Triton.", e)
+        USE_FLYDSL_MOE = False
 
 use_legacy_triton_kernels = False
 
@@ -189,6 +215,20 @@ def triton_kernel_moe_forward(
         and quant_config.use_mxfp4_w4a8
         and rocm_aiter_ops.is_enabled()
     ):
+        if USE_FLYDSL_MOE:
+            return flydsl_mxfp4_w4a8_experts(
+                hidden_states, w1, w2,
+                gating_output, topk, renormalize,
+                quant_config=quant_config,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                unpadded_N_w1=unpadded_N_w1,
+                unpadded_K_w1=unpadded_K_w1,
+                unpadded_N_w2=unpadded_N_w2,
+                unpadded_K_w2=unpadded_K_w2,
+            )
+
         from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
 
         routing_data, gather_idx, scatter_idx = aiter_routing(
@@ -388,6 +428,19 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
     unpadded_N_w2=None,
     unpadded_K_w2=None,
 ) -> torch.Tensor:
+    if USE_FLYDSL_MOE:
+        return flydsl_mxfp4_w4a8_experts(
+            output_tensor, hidden_states, w1, w2,
+            routing_data, gather_indx, scatter_indx,
+            activation, quant_config,
+            swiglu_alpha, swiglu_limit,
+            apply_router_weight_on_input,
+            global_num_experts, expert_map,
+            a1q_scale,
+            unpadded_N_w1, unpadded_K_w1,
+            unpadded_N_w2, unpadded_K_w2,
+        )
+
     assert quant_config is not None
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
