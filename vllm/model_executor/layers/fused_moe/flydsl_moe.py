@@ -86,8 +86,9 @@ def _convert_weights(w_data, actual_K, padded_K, padded_N):
     w_q, w_scale, _ = fp4_utils.per_1x32_f4_quant(w_fp32)
     w_shuffled = fp4_utils.shuffle_weight_w4(w_q, 16, True, True)
 
-    # Flatten: [E, padded_N, padded_K_packed] -> [E*padded_N, padded_K]
-    w_flat = w_shuffled.view(E * padded_N, padded_K).contiguous()
+    # Flatten: [E, padded_N, padded_K_packed] -> [E*padded_N, padded_K_packed]
+    # Note: float4_e2m1fn_x2 stores 2 values per element, so physical size = padded_K // 2
+    w_flat = w_shuffled.view(E * padded_N, padded_K // 2).contiguous()
     w_scale_flat = w_scale.view(E * padded_N, -1).contiguous()
 
     result = (w_flat, w_scale_flat)
