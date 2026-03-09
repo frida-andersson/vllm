@@ -1,84 +1,109 @@
 # SPDX-License-Identifier: Apache-2.0
 """CK/AITER 2-stage MoE with dimension padding for gpt-oss-120b.
 
-Pads K from 2880 to 3072 so K//32=96 passes the (N_i // 2) % 2 == 0
-assertion in AITER's mxfp4_sort. Uses the existing fused_moe_2stages
-CK kernel which is already optimized for MXFP4 on gfx950.
+Pads K from 2880 to 3072 so K//32=96 passes AITER's assertion.
+Uses original safetensors scales instead of CDNA4-swizzled vLLM scales.
 """
+import glob
 import logging
 import torch
 
 logger = logging.getLogger(__name__)
 
-_PAD_MULTIPLE = 128  # K//32 must be divisible by 4, so K must be multiple of 128
-_padded_weight_cache: dict = {}
+_PAD_MULTIPLE = 128
+_cache: dict = {}  # cached (w_padded, s_padded) by tensor id
+_scale_cache: dict = {}  # cached original scales by (layer_idx, proj_name)
+_layer_counter = 0
 
 
 def _pad_dim(x: int) -> int:
-    """Pad to next multiple where K//32 is divisible by 4."""
     target = ((x + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
     while (target // 32) % 4 != 0:
         target += _PAD_MULTIPLE
     return target
 
 
-def _pad_weights_and_scales(w_data, w_scale_data, actual_K, padded_K):
-    """Pad weight and scale K dimensions. Cached."""
-    cache_key = id(w_data)
-    if cache_key in _padded_weight_cache:
-        return _padded_weight_cache[cache_key]
+def _load_scales(layer_idx, proj_name, E, device):
+    key = (layer_idx, proj_name)
+    if key in _scale_cache:
+        return _scale_cache[key]
 
-    E, N, K_packed = w_data.shape  # row-major: [E, N, K_packed]
-    actual_K_packed = K_packed
+    from safetensors import safe_open
+    paths = sorted(glob.glob(
+        "/root/.cache/huggingface/hub/models--amd--gpt-oss-120b*/snapshots/*/*.safetensors"))
+    scales = []
+    for path in paths:
+        with safe_open(path, framework="pt") as f:
+            for skey in f.keys():
+                if (f"layers.{layer_idx}.mlp.experts." in skey
+                    and proj_name in skey and "weight_scale" in skey):
+                    scales.append((skey, f.get_tensor(skey).to(device)))
+        if len(scales) >= E:
+            break
+    scales.sort(key=lambda x: int(x[0].split("experts.")[1].split(".")[0]))
+    result = torch.stack([s[1] for s in scales[:E]])
+    _scale_cache[key] = result
+    logger.info("Loaded original scales: layer=%d proj=%s shape=%s", layer_idx, proj_name, list(result.shape))
+    return result
+
+
+def _get_padded(w_data, layer_idx, proj_name, padded_K, device):
+    """Get padded weight + original scale. Cached."""
+    ckey = id(w_data)
+    if ckey in _cache:
+        return _cache[ckey]
+
+    E, K_packed, N = w_data.shape
     padded_K_packed = padded_K // 2
-
-    _, _, K_scale = w_scale_data.shape  # row-major: [E, N, K_scale]
     padded_K_scale = padded_K // 32
 
-    # Pad weight K dimension (row-major: [E, N, K_packed])
-    if padded_K_packed > actual_K_packed:
-        pad_w = torch.zeros(E, N, padded_K_packed - actual_K_packed,
-                           dtype=torch.uint8, device=w_data.device).view(w_data.dtype)
-        w_padded = torch.cat([w_data, pad_w], dim=-1)
-    else:
-        w_padded = w_data
+    # Weight: col-major [E, K_packed, N] -> row-major [E, N, K_packed]
+    w_fp4 = w_data.view(torch.float4_e2m1fn_x2) if w_data.dtype == torch.uint8 else w_data
+    w_row = w_fp4.permute(0, 2, 1).contiguous()
 
-    # Pad scale K dimension (row-major: [E, N, K_scale])
-    if padded_K_scale > K_scale:
-        pad_s = torch.zeros(E, N, padded_K_scale - K_scale,
-                           dtype=torch.uint8, device=w_scale_data.device).view(w_scale_data.dtype)
-        s_padded = torch.cat([w_scale_data, pad_s], dim=-1)
-    else:
-        s_padded = w_scale_data
+    # Pad weight K
+    if padded_K_packed > K_packed:
+        pad = torch.zeros(E, N, padded_K_packed - K_packed,
+                         dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2)
+        w_row = torch.cat([w_row, pad], dim=-1)
 
-    result = (w_padded, s_padded)
-    _padded_weight_cache[cache_key] = result
-    logger.info("CK MoE padding: E=%d N=%d K=%d->%d K_scale=%d->%d",
-                E, N, actual_K, padded_K, K_scale, padded_K_scale)
+    # Load original scales: [E, N_orig, K//32]
+    s_orig = _load_scales(layer_idx, proj_name, E, device)
+    N_orig = s_orig.shape[1]
+    K_scale_orig = s_orig.shape[2]
+
+    # Pad scale K
+    if padded_K_scale > K_scale_orig:
+        pad = torch.zeros(E, N_orig, padded_K_scale - K_scale_orig,
+                         dtype=s_orig.dtype, device=device)
+        s_orig = torch.cat([s_orig, pad], dim=-1)
+
+    # Pad scale N (original is unpadded, weight N may be padded by vLLM)
+    if N > N_orig:
+        pad = torch.zeros(E, N - N_orig, padded_K_scale,
+                         dtype=s_orig.dtype, device=device)
+        s_orig = torch.cat([s_orig, pad], dim=1)
+
+    result = (w_row, s_orig)
+    _cache[ckey] = result
+    logger.info("CK MoE cached: E=%d N=%d K=%d->%d scale=%s",
+                E, N, K_packed*2, padded_K, list(s_orig.shape))
     return result
 
 
 def ck_mxfp4_w4a8_experts(
-    hidden_states: torch.Tensor,
-    w1, w2,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    quant_config=None,
-    apply_router_weight_on_input=False,
-    global_num_experts=-1,
-    expert_map=None,
+    hidden_states, w1, w2, gating_output, topk, renormalize,
+    quant_config=None, apply_router_weight_on_input=False,
+    global_num_experts=-1, expert_map=None,
     unpadded_N_w1=None, unpadded_K_w1=None,
     unpadded_N_w2=None, unpadded_K_w2=None,
 ):
-    """Route MXFP4 MoE through AITER's CK 2-stage kernel with K-padding."""
+    global _layer_counter
     import aiter
     from aiter import QuantType, ActivationType
     from aiter.fused_moe import fused_moe_2stages, moe_sorting
 
     assert quant_config is not None
-    assert hidden_states.dtype == torch.bfloat16
-
     M = hidden_states.shape[0]
     actual_K = hidden_states.shape[-1]
     padded_K = _pad_dim(actual_K)
@@ -88,100 +113,40 @@ def ck_mxfp4_w4a8_experts(
     w2_data = w2.storage.data if hasattr(w2, 'storage') else w2
     E = w1_data.shape[0]
 
-    # Weights: col-major [E, K_packed, N] -> row-major [E, N, K_packed]
-    if w1_data.dtype == torch.uint8:
-        w1_data = w1_data.view(torch.float4_e2m1fn_x2)
-    if w2_data.dtype == torch.uint8:
-        w2_data = w2_data.view(torch.float4_e2m1fn_x2)
+    # Determine layer index for scale loading
+    layer_idx = _layer_counter % 36
+    if id(w1_data) not in _cache:
+        _layer_counter += 1
+        layer_idx = (_layer_counter - 1) % 36
 
-    w1_row = w1_data.permute(0, 2, 1).contiguous()
-    w2_row = w2_data.permute(0, 2, 1).contiguous()
+    # Get padded weights + original scales (cached)
+    w1_row, w1_scale = _get_padded(w1_data, layer_idx, "gate_up_proj", padded_K, device)
+    w2_row, w2_scale = _get_padded(w2_data, layer_idx, "down_proj", padded_K, device)
 
-    # Scales: vLLM's processed scales are CDNA4-swizzled [E, K, N] -- NOT usable.
-    # Load original per-block E8M0 scales from safetensors: [E, N_orig, K//32]
-    import glob
-    from safetensors import safe_open
-
-    def load_scales(layer_idx, proj_name):
-        paths = sorted(glob.glob(
-            "/root/.cache/huggingface/hub/models--amd--gpt-oss-120b*/snapshots/*/*.safetensors"))
-        scales = []
-        for path in paths:
-            with safe_open(path, framework="pt") as f:
-                for skey in f.keys():
-                    if (f"layers.{layer_idx}.mlp.experts." in skey
-                        and proj_name in skey and "weight_scale" in skey):
-                        scales.append((skey, f.get_tensor(skey).to(device)))
-            if len(scales) >= E:
-                break
-        scales.sort(key=lambda x: int(x[0].split("experts.")[1].split(".")[0]))
-        return torch.stack([s[1] for s in scales[:E]])
-
-    # Determine layer index (rough: use weight cache key count)
-    global _layer_idx_counter
-    if not hasattr(ck_mxfp4_w4a8_experts, '_layer_idx'):
-        ck_mxfp4_w4a8_experts._layer_idx = 0
-    layer_idx = ck_mxfp4_w4a8_experts._layer_idx % 36
-    if id(w1_data) not in _padded_weight_cache:
-        ck_mxfp4_w4a8_experts._layer_idx += 1
-        layer_idx = (ck_mxfp4_w4a8_experts._layer_idx - 1) % 36
-
-    w1_scale_orig = load_scales(layer_idx, "gate_up_proj")  # [E, N_orig, K//32]
-    w2_scale_orig = load_scales(layer_idx, "down_proj")     # [E, N_orig, K//32]
-    logger.info("Loaded scales: w1=%s w2=%s", list(w1_scale_orig.shape), list(w2_scale_orig.shape))
-
-    # Pad scale N if weight N was padded by vLLM
-    N_w1 = w1_row.shape[1]
-    N_w2 = w2_row.shape[1]
-    if w1_scale_orig.shape[1] < N_w1:
-        pad = torch.zeros(E, N_w1 - w1_scale_orig.shape[1], w1_scale_orig.shape[2],
-                         dtype=w1_scale_orig.dtype, device=device)
-        w1_scale_orig = torch.cat([w1_scale_orig, pad], dim=1)
-    if w2_scale_orig.shape[1] < N_w2:
-        pad = torch.zeros(E, N_w2 - w2_scale_orig.shape[1], w2_scale_orig.shape[2],
-                         dtype=w2_scale_orig.dtype, device=device)
-        w2_scale_orig = torch.cat([w2_scale_orig, pad], dim=1)
-
-    w1_scale_row = w1_scale_orig
-    w2_scale_row = w2_scale_orig
-
-    # Pad hidden_states: [M, actual_K] -> [M, padded_K]
+    # Pad hidden_states
     if padded_K > actual_K:
         hidden_padded = torch.zeros(M, padded_K, dtype=hidden_states.dtype, device=device)
         hidden_padded[:, :actual_K] = hidden_states
     else:
         hidden_padded = hidden_states
 
-    # Pad weights and scales K dim (now row-major: [E, N, K_packed])
-    w1_padded, w1s_padded = _pad_weights_and_scales(w1_row, w1_scale_row, actual_K, padded_K)
-    w2_padded, w2s_padded = _pad_weights_and_scales(w2_row, w2_scale_row, actual_K, padded_K)
-
-    # Routing: gating_output -> topk -> moe_sorting
+    # Routing
     sm_first = not renormalize
-    if sm_first:
-        logits = torch.softmax(gating_output.float(), dim=-1)
-    else:
-        logits = gating_output.float()
+    logits = torch.softmax(gating_output.float(), dim=-1) if sm_first else gating_output.float()
     topk_vals, topk_ids = torch.topk(logits, k=topk, dim=-1)
-    if not sm_first:
-        topk_weights = torch.softmax(topk_vals, dim=-1)
-    else:
-        topk_weights = topk_vals
+    topk_weights = topk_vals if sm_first else torch.softmax(topk_vals, dim=-1)
     topk_weights = topk_weights.to(torch.float32)
     topk_ids = topk_ids.to(torch.int32)
 
     block_m = 32
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
-        topk_ids, topk_weights, E, block_m, None
-    )
+        topk_ids, topk_weights, E, block_m, None)
 
-    # Allocate output
     moe_out = torch.empty(M, padded_K, dtype=hidden_states.dtype, device=device)
 
-    # Call CK 2-stage kernel
     fused_moe_2stages(
         hidden_states=hidden_padded,
-        w1=w1_padded, w2=w2_padded,
+        w1=w1_row, w2=w2_row,
         topk=topk,
         sorted_ids=sorted_ids,
         sorted_weights=sorted_weights,
@@ -194,9 +159,8 @@ def ck_mxfp4_w4a8_experts(
         quant_type=QuantType.per_1x32,
         q_dtype_a=aiter.dtypes.fp4x2,
         q_dtype_w=aiter.dtypes.fp4x2,
-        w1_scale=w1s_padded,
-        w2_scale=w2s_padded,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
     )
 
-    # Trim output back to actual dimensions
     return moe_out[:, :actual_K]
