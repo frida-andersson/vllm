@@ -109,27 +109,34 @@ def _convert_weights(w_data, padded_K, padded_N, E, layer_idx, proj_name, device
         raise RuntimeError(f"Could not load original scales for layer {layer_idx} {proj_name}")
 
     s_e8m0 = orig_scales.view(fp4_utils.fp8_e8m0)
-    K_scale = s_e8m0.shape[-1]
+    N_scale = s_e8m0.shape[1]  # original unpadded N
+    K_scale = s_e8m0.shape[2]  # original K//32
 
-    # Pad K
     target_K_packed = padded_K // 2
     target_K_scale = padded_K // 32
+
+    # Pad weights K (vLLM usually already does this)
     if target_K_packed > K_packed:
         w_fp4 = torch.cat([w_fp4,
             torch.zeros(E, N, target_K_packed - K_packed, dtype=torch.uint8,
                        device=device).view(torch.float4_e2m1fn_x2)], dim=-1)
+
+    # Pad scales K
     if target_K_scale > K_scale:
         s_e8m0 = torch.cat([s_e8m0,
-            torch.zeros(E, N, target_K_scale - K_scale, dtype=torch.uint8,
+            torch.zeros(E, N_scale, target_K_scale - K_scale, dtype=torch.uint8,
                        device=device).view(fp4_utils.fp8_e8m0)], dim=-1)
 
-    # Pad N
+    # Pad weights N (vLLM usually already does this)
     if padded_N > N:
         w_fp4 = torch.cat([w_fp4,
             torch.zeros(E, padded_N - N, target_K_packed, dtype=torch.uint8,
                        device=device).view(torch.float4_e2m1fn_x2)], dim=1)
+
+    # Pad scales N (original scales are unpadded)
+    if padded_N > N_scale:
         s_e8m0 = torch.cat([s_e8m0,
-            torch.zeros(E, padded_N - N, target_K_scale, dtype=torch.uint8,
+            torch.zeros(E, padded_N - N_scale, target_K_scale, dtype=torch.uint8,
                        device=device).view(fp4_utils.fp8_e8m0)], dim=1)
 
     # Preshuffle weights
