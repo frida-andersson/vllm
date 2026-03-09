@@ -175,6 +175,13 @@ def flydsl_mxfp4_w4a8_experts(
     w2_kernel, w2_scale = _convert_weights(w2_data, actual_K, inter_dim_padded, N_w2, padded_N_w2, E)
 
     # --- Stage 1 ---
+    logger.info("Stage1 args: M=%d E=%d topk=%d padded_K=%d inter=%d actual_K=%d N_w1=%d",
+                M, E, topk, padded_K, inter_dim_padded, actual_K, N_w1)
+    logger.info("  x_fp8: %s %s contiguous=%s", list(x_fp8.shape), x_fp8.dtype, x_fp8.is_contiguous())
+    logger.info("  w1_kernel: %s %s contiguous=%s", list(w1_kernel.shape), w1_kernel.dtype, w1_kernel.is_contiguous())
+    logger.info("  w1_scale: %s %s contiguous=%s", list(w1_scale.shape), w1_scale.dtype, w1_scale.is_contiguous())
+    logger.info("  a_scale: %s %s", list(a_scale.shape), a_scale.dtype)
+    logger.info("  sorted: ids=%s eids=%s blocks=%d", list(sorted_ids.shape), list(sorted_expert_ids.shape), blocks)
     stage1 = _compile_stage1(padded_K, inter_dim_padded, E, topk, _TILE_N)
     out1 = torch.empty(M, topk, inter_dim_padded, dtype=torch.float16, device=hidden_states.device)
     bias1 = torch.empty(0, device=hidden_states.device, dtype=torch.float32)
