@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """FlyDSL MXFP4 MoE integration for vLLM.
 
-Uses compile_moe_gemm1/gemm2 with w_dtype="fp4" (NOT compile_mixed_moe_gemm1).
-Weight tensors stay 3D [E, N, K_packed], scales use shuffle_scale_w4.
+Uses compile_moe_gemm1/gemm2 with w_dtype="fp4".
+Directly preshuffles stored MXFP4 weights and scales -- no lossy
+dequant/requant roundtrip, preserving original MX scale information.
 """
 import functools
 import logging
@@ -25,8 +26,8 @@ def _pad_dim(x: int) -> int:
 @functools.lru_cache(maxsize=16)
 def _compile_stage1(model_dim, inter_dim, experts, topk, tile_n):
     from kernels.moe_gemm_2stage import compile_moe_gemm1
-    logger.info("Compiling FlyDSL stage1 (fp4): dim=%d inter=%d E=%d topk=%d tile_n=%d",
-                model_dim, inter_dim, experts, topk, tile_n)
+    logger.info("Compiling FlyDSL stage1 (fp4): dim=%d inter=%d E=%d topk=%d",
+                model_dim, inter_dim, experts, topk)
     return compile_moe_gemm1(
         model_dim=model_dim, inter_dim=inter_dim,
         experts=experts, topk=topk,
@@ -40,8 +41,8 @@ def _compile_stage1(model_dim, inter_dim, experts, topk, tile_n):
 @functools.lru_cache(maxsize=16)
 def _compile_stage2(model_dim, inter_dim, experts, topk, tile_n):
     from kernels.moe_gemm_2stage import compile_moe_gemm2
-    logger.info("Compiling FlyDSL stage2 (fp4): dim=%d inter=%d E=%d topk=%d tile_n=%d",
-                model_dim, inter_dim, experts, topk, tile_n)
+    logger.info("Compiling FlyDSL stage2 (fp4): dim=%d inter=%d E=%d topk=%d",
+                model_dim, inter_dim, experts, topk)
     return compile_moe_gemm2(
         model_dim=model_dim, inter_dim=inter_dim,
         experts=experts, topk=topk,
@@ -52,10 +53,11 @@ def _compile_stage2(model_dim, inter_dim, experts, topk, tile_n):
     )
 
 
-def _convert_weights(w_data, actual_K, padded_K, actual_N, padded_N, E):
-    """Convert vLLM MXFP4 weights to FlyDSL format. Cached.
-    
-    FP4 path: weights stay 3D [E, N, K_packed], scales use shuffle_scale_w4.
+def _convert_weights(w_data, w_scale_data, padded_K, padded_N, E):
+    """Preshuffle stored MXFP4 weights + scales for FlyDSL. Cached.
+
+    No dequant/requant roundtrip -- directly reinterprets stored bytes as fp4x2
+    and preshuffles. Preserves original MX scales for correct numerics.
     """
     cache_key = id(w_data)
     if cache_key in _weight_cache:
@@ -64,40 +66,49 @@ def _convert_weights(w_data, actual_K, padded_K, actual_N, padded_N, E):
     from tests.kernels.utils import fp4_utils
 
     _, K_packed, N = w_data.shape
-    logger.info("_convert_weights: E=%d K_packed=%d N=%d shape=%s stride=%s dtype=%s",
-                E, K_packed, N, list(w_data.shape), w_data.stride(), w_data.dtype)
+    _, K_scale, _ = w_scale_data.shape
+    logger.info("_convert_weights: E=%d K_packed=%d N=%d K_scale=%d padded_K=%d padded_N=%d",
+                E, K_packed, N, K_scale, padded_K, padded_N)
 
-    # Convert col-major [E, K_packed, N] to row-major [E, N, K_packed]
+    # Weights: col-major [E, K_packed, N] -> row-major [E, N, K_packed]
     w_row = w_data.permute(0, 2, 1).contiguous()
+    w_fp4 = w_row.view(torch.float4_e2m1fn_x2)
 
-    # Pad K
-    padded_K_packed = padded_K // 2
-    if padded_K_packed > K_packed:
-        w_row = torch.cat([w_row, torch.zeros(E, N, padded_K_packed - K_packed,
-                          dtype=torch.uint8, device=w_data.device)], dim=-1)
+    # Scales: col-major [E, K_scale, N] -> row-major [E, N, K_scale]
+    s_row = w_scale_data.permute(0, 2, 1).contiguous()
+    s_e8m0 = s_row.view(fp4_utils.fp8_e8m0)
 
-    # Pad N
+    # Pad K if needed
+    target_K_packed = padded_K // 2
+    target_K_scale = padded_K // 32
+    if target_K_packed > K_packed:
+        w_fp4 = torch.cat([w_fp4,
+            torch.zeros(E, N, target_K_packed - K_packed, dtype=torch.uint8,
+                       device=w_data.device).view(torch.float4_e2m1fn_x2)], dim=-1)
+        s_e8m0 = torch.cat([s_e8m0,
+            torch.zeros(E, N, target_K_scale - K_scale, dtype=torch.uint8,
+                       device=w_data.device).view(fp4_utils.fp8_e8m0)], dim=-1)
+
+    # Pad N if needed
     if padded_N > N:
-        w_row = torch.cat([w_row, torch.zeros(E, padded_N - N, padded_K_packed,
-                          dtype=torch.uint8, device=w_data.device)], dim=1)
+        w_fp4 = torch.cat([w_fp4,
+            torch.zeros(E, padded_N - N, target_K_packed, dtype=torch.uint8,
+                       device=w_data.device).view(torch.float4_e2m1fn_x2)], dim=1)
+        s_e8m0 = torch.cat([s_e8m0,
+            torch.zeros(E, padded_N - N, target_K_scale, dtype=torch.uint8,
+                       device=w_data.device).view(fp4_utils.fp8_e8m0)], dim=1)
 
-    # Dequantize -> requantize to get FlyDSL-compatible fp4x2 + scales
-    w_fp32 = fp4_utils.mxfp4_to_f32(w_row)
-    del w_row
-    w_q, w_scale, _ = fp4_utils.per_1x32_f4_quant(w_fp32)
-    del w_fp32
-    torch.cuda.empty_cache()
+    # Preshuffle weights (stays 3D)
+    w_shuffled = fp4_utils.shuffle_weight_w4(w_fp4, 16, True, True)
 
-    # Preshuffle weights (stays 3D, NOT flattened)
-    w_shuffled = fp4_utils.shuffle_weight_w4(w_q, 16, True, True)
-
-    # Shuffle scales (FP4 path uses shuffle_scale_w4, not just view)
-    w_scale_shuffled = fp4_utils.shuffle_scale_w4(w_scale, E, True)
+    # Reshape scales to [E*padded_N, target_K_scale] then shuffle
+    s_flat = s_e8m0.reshape(E * padded_N, target_K_scale).contiguous()
+    w_scale_shuffled = fp4_utils.shuffle_scale_w4(s_flat, E, True)
 
     result = (w_shuffled, w_scale_shuffled)
     _weight_cache[cache_key] = result
-    logger.info("FlyDSL weight conversion done: E=%d N=%d->%d K=%d->%d",
-                E, actual_N, padded_N, actual_K, padded_K)
+    logger.info("FlyDSL weight conversion done (no roundtrip): E=%d N=%d K_packed=%d",
+                E, padded_N, target_K_packed)
     return result
 
 
@@ -128,9 +139,11 @@ def flydsl_mxfp4_w4a8_experts(
 
     w1_data = w1.storage.data if hasattr(w1, 'storage') else w1
     w2_data = w2.storage.data if hasattr(w2, 'storage') else w2
+    w1_scale_data = quant_config.w1_precision.weight_scale.storage.data
+    w2_scale_data = quant_config.w2_precision.weight_scale.storage.data
     E = w1_data.shape[0]
-    N_w1 = w1_data.shape[2]  # 5760
-    N_w2 = w2_data.shape[2]  # 2880
+    N_w1 = w1_data.shape[2]
+    N_w2 = w2_data.shape[2]
 
     inter_dim_padded = _pad_dim(N_w1 // 2)
     padded_N_w1 = 2 * inter_dim_padded
@@ -142,7 +155,6 @@ def flydsl_mxfp4_w4a8_experts(
         logits = torch.softmax(gating_output.float(), dim=-1)
     else:
         logits = gating_output.float()
-
     topk_vals, topk_ids = torch.topk(logits, k=topk, dim=-1)
     if not sm_first:
         topk_weights = torch.softmax(topk_vals, dim=-1)
@@ -168,24 +180,17 @@ def flydsl_mxfp4_w4a8_experts(
     # --- Quantize to FP8 ---
     x_scale = quant_config.w1_precision.flex_ctx.lhs_data.scale
     x_fp8 = downcast_to_static_fp8(hidden_padded, x_scale)
+    a_scale = torch.ones([M, padded_K // 32], dtype=fp4_utils.fp8_e8m0,
+                         device=hidden_states.device)
 
-    # Activation scale for FP4 path
-    a_scale = torch.ones([M, padded_K // 32], dtype=fp4_utils.fp8_e8m0, device=hidden_states.device)
-
-    # --- Convert weights (cached) ---
-    w1_kernel, w1_scale = _convert_weights(w1_data, actual_K, padded_K, N_w1, padded_N_w1, E)
-    w2_kernel, w2_scale = _convert_weights(w2_data, actual_K, inter_dim_padded, N_w2, padded_N_w2, E)
+    # --- Convert weights (cached, no dequant roundtrip) ---
+    w1_kernel, w1_scale = _convert_weights(w1_data, w1_scale_data, padded_K, padded_N_w1, E)
+    w2_kernel, w2_scale = _convert_weights(w2_data, w2_scale_data, inter_dim_padded, padded_N_w2, E)
 
     # --- Stage 1 ---
-    logger.info("Stage1 args: M=%d E=%d topk=%d padded_K=%d inter=%d actual_K=%d N_w1=%d",
-                M, E, topk, padded_K, inter_dim_padded, actual_K, N_w1)
-    logger.info("  x_fp8: %s %s contiguous=%s", list(x_fp8.shape), x_fp8.dtype, x_fp8.is_contiguous())
-    logger.info("  w1_kernel: %s %s contiguous=%s", list(w1_kernel.shape), w1_kernel.dtype, w1_kernel.is_contiguous())
-    logger.info("  w1_scale: %s %s contiguous=%s", list(w1_scale.shape), w1_scale.dtype, w1_scale.is_contiguous())
-    logger.info("  a_scale: %s %s", list(a_scale.shape), a_scale.dtype)
-    logger.info("  sorted: ids=%s eids=%s blocks=%d", list(sorted_ids.shape), list(sorted_expert_ids.shape), blocks)
     stage1 = _compile_stage1(padded_K, inter_dim_padded, E, topk, _TILE_N)
-    out1 = torch.empty(M, topk, inter_dim_padded, dtype=torch.float16, device=hidden_states.device)
+    out1 = torch.empty(M, topk, inter_dim_padded, dtype=torch.float16,
+                       device=hidden_states.device)
     bias1 = torch.empty(0, device=hidden_states.device, dtype=torch.float32)
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
@@ -204,7 +209,8 @@ def flydsl_mxfp4_w4a8_experts(
 
     # --- Stage 2 ---
     stage2 = _compile_stage2(padded_K, inter_dim_padded, E, topk, _TILE_N)
-    out2 = torch.zeros(M, padded_K, dtype=torch.float16, device=hidden_states.device)
+    out2 = torch.zeros(M, padded_K, dtype=torch.float16,
+                       device=hidden_states.device)
     bias2 = torch.empty(0, device=hidden_states.device, dtype=torch.float32)
 
     stage2(out2,
