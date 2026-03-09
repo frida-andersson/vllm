@@ -86,25 +86,64 @@ def ck_mxfp4_w4a8_experts(
 
     w1_data = w1.storage.data if hasattr(w1, 'storage') else w1
     w2_data = w2.storage.data if hasattr(w2, 'storage') else w2
-    w1_scale = quant_config.w1_precision.weight_scale.storage.data
-    w2_scale = quant_config.w2_precision.weight_scale.storage.data
     E = w1_data.shape[0]
 
-    # Weights are col-major [E, K_packed, N] from vLLM. 
-    # fused_moe_2stages expects row-major [E, N, K_packed].
-    # Also view as fp4x2 if currently uint8.
+    # Weights: col-major [E, K_packed, N] -> row-major [E, N, K_packed]
     if w1_data.dtype == torch.uint8:
         w1_data = w1_data.view(torch.float4_e2m1fn_x2)
     if w2_data.dtype == torch.uint8:
         w2_data = w2_data.view(torch.float4_e2m1fn_x2)
 
-    # Transpose to row-major: [E, K_packed, N] -> [E, N, K_packed]
     w1_row = w1_data.permute(0, 2, 1).contiguous()
     w2_row = w2_data.permute(0, 2, 1).contiguous()
 
-    # Scales are also col-major [E, K_scale, N] -> [E, N, K_scale]
-    w1_scale_row = w1_scale.permute(0, 2, 1).contiguous()
-    w2_scale_row = w2_scale.permute(0, 2, 1).contiguous()
+    # Scales: vLLM's processed scales are CDNA4-swizzled [E, K, N] -- NOT usable.
+    # Load original per-block E8M0 scales from safetensors: [E, N_orig, K//32]
+    import glob
+    from safetensors import safe_open
+
+    def load_scales(layer_idx, proj_name):
+        paths = sorted(glob.glob(
+            "/root/.cache/huggingface/hub/models--amd--gpt-oss-120b*/snapshots/*/*.safetensors"))
+        scales = []
+        for path in paths:
+            with safe_open(path, framework="pt") as f:
+                for skey in f.keys():
+                    if (f"layers.{layer_idx}.mlp.experts." in skey
+                        and proj_name in skey and "weight_scale" in skey):
+                        scales.append((skey, f.get_tensor(skey).to(device)))
+            if len(scales) >= E:
+                break
+        scales.sort(key=lambda x: int(x[0].split("experts.")[1].split(".")[0]))
+        return torch.stack([s[1] for s in scales[:E]])
+
+    # Determine layer index (rough: use weight cache key count)
+    global _layer_idx_counter
+    if not hasattr(ck_mxfp4_w4a8_experts, '_layer_idx'):
+        ck_mxfp4_w4a8_experts._layer_idx = 0
+    layer_idx = ck_mxfp4_w4a8_experts._layer_idx % 36
+    if id(w1_data) not in _padded_weight_cache:
+        ck_mxfp4_w4a8_experts._layer_idx += 1
+        layer_idx = (ck_mxfp4_w4a8_experts._layer_idx - 1) % 36
+
+    w1_scale_orig = load_scales(layer_idx, "gate_up_proj")  # [E, N_orig, K//32]
+    w2_scale_orig = load_scales(layer_idx, "down_proj")     # [E, N_orig, K//32]
+    logger.info("Loaded scales: w1=%s w2=%s", list(w1_scale_orig.shape), list(w2_scale_orig.shape))
+
+    # Pad scale N if weight N was padded by vLLM
+    N_w1 = w1_row.shape[1]
+    N_w2 = w2_row.shape[1]
+    if w1_scale_orig.shape[1] < N_w1:
+        pad = torch.zeros(E, N_w1 - w1_scale_orig.shape[1], w1_scale_orig.shape[2],
+                         dtype=w1_scale_orig.dtype, device=device)
+        w1_scale_orig = torch.cat([w1_scale_orig, pad], dim=1)
+    if w2_scale_orig.shape[1] < N_w2:
+        pad = torch.zeros(E, N_w2 - w2_scale_orig.shape[1], w2_scale_orig.shape[2],
+                         dtype=w2_scale_orig.dtype, device=device)
+        w2_scale_orig = torch.cat([w2_scale_orig, pad], dim=1)
+
+    w1_scale_row = w1_scale_orig
+    w2_scale_row = w2_scale_orig
 
     # Pad hidden_states: [M, actual_K] -> [M, padded_K]
     if padded_K > actual_K:
