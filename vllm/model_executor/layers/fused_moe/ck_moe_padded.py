@@ -119,9 +119,14 @@ def ck_mxfp4_w4a8_experts(
         _layer_counter += 1
         layer_idx = (_layer_counter - 1) % 36
 
-    # Get padded weights + original scales (cached)
-    w1_row, w1_scale = _get_padded(w1_data, layer_idx, "gate_up_proj", padded_K, device)
-    w2_row, w2_scale = _get_padded(w2_data, layer_idx, "down_proj", padded_K, device)
+    # Get padded weights (cached) + use vLLM's processed scales directly
+    w1_row, _ = _get_padded(w1_data, layer_idx, "gate_up_proj", padded_K, device)
+    w2_row, _ = _get_padded(w2_data, layer_idx, "down_proj", padded_K, device)
+
+    # Use vLLM's CDNA4-swizzled scales AS-IS -- the fmoe_g1u1 kernel expects
+    # this format (it does w1_scale.view(E, -1) internally).
+    w1_scale = quant_config.w1_precision.weight_scale.storage.data
+    w2_scale = quant_config.w2_precision.weight_scale.storage.data
 
     # Pad hidden_states
     if padded_K > actual_K:
