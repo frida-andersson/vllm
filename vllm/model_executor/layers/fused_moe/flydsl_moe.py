@@ -245,7 +245,7 @@ def flydsl_mxfp4_w4a8_experts(
            w1_kernel, a_scale.view(-1), w1_scale,
            sorted_ids, sorted_expert_ids, sorted_weights,
            num_valid_ids, bias1,
-           M, 2 * inter_dim_padded, padded_K, blocks, stream_ptr)
+           M, inter_dim_padded, padded_K, blocks, stream_ptr)
 
     # Quantize intermediate
     out1_fp8 = out1.view(-1, inter_dim_padded).to(torch.float8_e4m3fn)
