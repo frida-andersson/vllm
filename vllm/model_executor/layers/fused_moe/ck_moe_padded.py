@@ -125,8 +125,8 @@ def ck_mxfp4_w4a8_experts(
 
     # Use vLLM's CDNA4-swizzled scales AS-IS -- the fmoe_g1u1 kernel expects
     # this format (it does w1_scale.view(E, -1) internally).
-    w1_scale = quant_config.w1_precision.weight_scale.storage.data
-    w2_scale = quant_config.w2_precision.weight_scale.storage.data
+    w1_scale = quant_config.w1_precision.weight_scale.storage.data.contiguous()
+    w2_scale = quant_config.w2_precision.weight_scale.storage.data.contiguous()
 
     # Pad hidden_states
     if padded_K > actual_K:
