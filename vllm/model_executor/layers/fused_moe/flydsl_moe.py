@@ -28,12 +28,15 @@ def _pad_dim(x: int) -> int:
 @functools.lru_cache(maxsize=16)
 def _compile_stage1(model_dim, inter_dim, experts, topk):
     from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
-    logger.info("Compiling FlyDSL stage1: dim=%d inter=%d E=%d topk=%d",
-                model_dim, inter_dim, experts, topk)
+    # Stage1 uses dual accumulators (gate+up), halving effective tile_n.
+    # CShuffle requires effective tile_n >= 128, so we need tile_n >= 256.
+    tile_n = max(_TILE_N, 256)
+    logger.info("Compiling FlyDSL stage1: dim=%d inter=%d E=%d topk=%d tile_n=%d",
+                model_dim, inter_dim, experts, topk, tile_n)
     return compile_mixed_moe_gemm1(
         model_dim=model_dim, inter_dim=inter_dim,
         experts=experts, topk=topk,
-        tile_m=_TILE_M, tile_n=_TILE_N, tile_k=_TILE_K,
+        tile_m=_TILE_M, tile_n=tile_n, tile_k=_TILE_K,
         doweight_stage1=True,
         a_dtype="fp8", b_dtype="fp4", out_dtype="f16",
     )
@@ -102,41 +105,6 @@ def flydsl_mxfp4_w4a8_experts(
     unpadded_N_w2=None, unpadded_K_w2=None,
 ):
     """FlyDSL MoE: takes gating_output directly, handles routing internally."""
-    try:
-        return _flydsl_forward(
-            hidden_states, w1, w2, gating_output, topk, renormalize,
-            quant_config, apply_router_weight_on_input, global_num_experts,
-            expert_map, unpadded_N_w1, unpadded_K_w1, unpadded_N_w2, unpadded_K_w2,
-        )
-    except Exception as e:
-        logger.warning("FlyDSL MoE failed: %s. Falling back to Triton.", e)
-        from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
-        from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
-            triton_kernel_fused_mxfp4_w4a8_experts as _triton_fn,
-        )
-        rd, gi, si = aiter_routing(gating_output, topk, sm_first=not renormalize)
-        # Temporarily disable FlyDSL to call original Triton path
-        import vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe as _mod
-        old_flag = _mod.USE_FLYDSL_MOE
-        _mod.USE_FLYDSL_MOE = False
-        try:
-            return _triton_fn(
-                None, hidden_states, w1, w2, rd, gi, si,
-                quant_config=quant_config,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts, expert_map=expert_map,
-                unpadded_N_w1=unpadded_N_w1, unpadded_K_w1=unpadded_K_w1,
-                unpadded_N_w2=unpadded_N_w2, unpadded_K_w2=unpadded_K_w2,
-            )
-        finally:
-            _mod.USE_FLYDSL_MOE = old_flag
-
-
-def _flydsl_forward(
-    hidden_states, w1, w2, gating_output, topk, renormalize,
-    quant_config, apply_router_weight_on_input, global_num_experts,
-    expert_map, unpadded_N_w1, unpadded_K_w1, unpadded_N_w2, unpadded_K_w2,
-):
     from aiter.fused_moe import moe_sorting
     from aiter.ops.triton.quant_moe import downcast_to_static_fp8
     from tests.kernels.utils import fp4_utils
