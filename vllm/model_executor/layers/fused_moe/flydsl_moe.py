@@ -163,9 +163,15 @@ def flydsl_mxfp4_w4a8_experts(
 
     out1 = torch.empty(sorted_size, inter_dim_padded, dtype=torch.float16,
                        device=hidden_states.device)
-    stage1(out1, x_fp8, w1_flat, a_scale, w1_scale,
+    bias_arg = torch.empty(0, device=hidden_states.device, dtype=torch.float32)
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+    stage1(out1,
+           x_fp8.view(-1), w1_flat.view(-1),
+           a_scale.view(-1), w1_scale.view(-1),
            sorted_ids, sorted_expert_ids, sorted_weights,
-           num_valid_ids, M, 2 * inter_dim_padded, padded_K, blocks)
+           num_valid_ids, bias_arg,
+           M, 2 * inter_dim_padded, padded_K, blocks,
+           stream_ptr)
 
     out1_fp8 = out1.to(torch.float8_e4m3fn)
     a2_scale = torch.ones([sorted_size, inter_dim_padded // 32],
@@ -175,8 +181,10 @@ def flydsl_mxfp4_w4a8_experts(
 
     out2 = torch.zeros(M, padded_K, dtype=torch.float16,
                        device=hidden_states.device)
-    stage2(out2, out1_fp8, w2_flat, a2_scale, w2_scale,
+    stage2(out2, out1_fp8.view(-1), w2_flat.view(-1), a2_scale.view(-1), w2_scale.view(-1),
            sorted_ids, sorted_expert_ids, sorted_weights,
-           num_valid_ids, M, padded_K, inter_dim_padded, blocks)
+           num_valid_ids, bias_arg,
+           M, padded_K, inter_dim_padded, blocks,
+           stream_ptr)
 
     return out2[:, :actual_K].to(hidden_states.dtype)
