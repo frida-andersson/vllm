@@ -101,7 +101,7 @@ def ck_mxfp4_w4a8_experts(
     global _layer_counter
     import aiter
     from aiter import QuantType, ActivationType
-    from aiter.fused_moe import fused_moe_2stages, moe_sorting
+    from aiter.fused_moe import fused_moe_1stage, moe_sorting
 
     assert quant_config is not None
     M = hidden_states.shape[0]
@@ -144,7 +144,9 @@ def ck_mxfp4_w4a8_experts(
 
     moe_out = torch.empty(M, padded_K, dtype=hidden_states.dtype, device=device)
 
-    fused_moe_2stages(
+    # Use 1-stage kernel (fmoe_g1u1) -- the 2-stage CK path has correctness
+    # issues for per_1x32 MXFP4. The 1-stage path calls aiter.fmoe_g1u1 directly.
+    fused_moe_1stage(
         hidden_states=hidden_padded,
         w1=w1_row, w2=w2_row,
         topk=topk,
@@ -152,7 +154,7 @@ def ck_mxfp4_w4a8_experts(
         sorted_weights=sorted_weights,
         sorted_expert_ids=sorted_expert_ids,
         num_valid_ids=num_valid_ids,
-        moe_out=moe_out,
+        moe_buf=moe_out,
         isG1U1=True,
         block_size_M=block_m,
         activation=ActivationType.Silu,
