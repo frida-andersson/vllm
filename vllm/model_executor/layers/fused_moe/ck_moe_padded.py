@@ -28,26 +28,26 @@ def _pad_weights_and_scales(w_data, w_scale_data, actual_K, padded_K):
     if cache_key in _padded_weight_cache:
         return _padded_weight_cache[cache_key]
 
-    E, K_packed, N = w_data.shape
+    E, N, K_packed = w_data.shape  # row-major: [E, N, K_packed]
     actual_K_packed = K_packed
     padded_K_packed = padded_K // 2
 
-    _, K_scale, _ = w_scale_data.shape
+    _, _, K_scale = w_scale_data.shape  # row-major: [E, N, K_scale]
     padded_K_scale = padded_K // 32
 
-    # Pad weight K dimension (col-major: [E, K_packed, N])
+    # Pad weight K dimension (row-major: [E, N, K_packed])
     if padded_K_packed > actual_K_packed:
-        pad_w = torch.zeros(E, padded_K_packed - actual_K_packed, N,
+        pad_w = torch.zeros(E, N, padded_K_packed - actual_K_packed,
                            dtype=torch.uint8, device=w_data.device).view(w_data.dtype)
-        w_padded = torch.cat([w_data, pad_w], dim=1)
+        w_padded = torch.cat([w_data, pad_w], dim=-1)
     else:
         w_padded = w_data
 
-    # Pad scale K dimension (col-major: [E, K_scale, N])
+    # Pad scale K dimension (row-major: [E, N, K_scale])
     if padded_K_scale > K_scale:
-        pad_s = torch.zeros(E, padded_K_scale - K_scale, N,
+        pad_s = torch.zeros(E, N, padded_K_scale - K_scale,
                            dtype=torch.uint8, device=w_scale_data.device).view(w_scale_data.dtype)
-        s_padded = torch.cat([w_scale_data, pad_s], dim=1)
+        s_padded = torch.cat([w_scale_data, pad_s], dim=-1)
     else:
         s_padded = w_scale_data
 
@@ -90,14 +90,21 @@ def ck_mxfp4_w4a8_experts(
     w2_scale = quant_config.w2_precision.weight_scale.storage.data
     E = w1_data.shape[0]
 
-    # The CK kernel needs actual K//32 scale format, not CDNA4-swizzled.
-    # vLLM's scales might already be processed. We pass them through and
-    # let the CK kernel handle the format -- it uses QuantType.per_1x32.
-    # But the weights must be viewed as fp4x2, not uint8.
+    # Weights are col-major [E, K_packed, N] from vLLM. 
+    # fused_moe_2stages expects row-major [E, N, K_packed].
+    # Also view as fp4x2 if currently uint8.
     if w1_data.dtype == torch.uint8:
         w1_data = w1_data.view(torch.float4_e2m1fn_x2)
     if w2_data.dtype == torch.uint8:
         w2_data = w2_data.view(torch.float4_e2m1fn_x2)
+
+    # Transpose to row-major: [E, K_packed, N] -> [E, N, K_packed]
+    w1_row = w1_data.permute(0, 2, 1).contiguous()
+    w2_row = w2_data.permute(0, 2, 1).contiguous()
+
+    # Scales are also col-major [E, K_scale, N] -> [E, N, K_scale]
+    w1_scale_row = w1_scale.permute(0, 2, 1).contiguous()
+    w2_scale_row = w2_scale.permute(0, 2, 1).contiguous()
 
     # Pad hidden_states: [M, actual_K] -> [M, padded_K]
     if padded_K > actual_K:
@@ -106,9 +113,9 @@ def ck_mxfp4_w4a8_experts(
     else:
         hidden_padded = hidden_states
 
-    # Pad weights and scales (cached)
-    w1_padded, w1s_padded = _pad_weights_and_scales(w1_data, w1_scale, actual_K, padded_K)
-    w2_padded, w2s_padded = _pad_weights_and_scales(w2_data, w2_scale, actual_K, padded_K)
+    # Pad weights and scales K dim (now row-major: [E, N, K_packed])
+    w1_padded, w1s_padded = _pad_weights_and_scales(w1_row, w1_scale_row, actual_K, padded_K)
+    w2_padded, w2s_padded = _pad_weights_and_scales(w2_row, w2_scale_row, actual_K, padded_K)
 
     # Routing: gating_output -> topk -> moe_sorting
     sm_first = not renormalize
