@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -26,6 +27,21 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_triton_kernels
 
 logger = init_logger(__name__)
+
+USE_CK_MOE = os.environ.get("VLLM_USE_CK_MOE", "0") == "1"
+if USE_CK_MOE:
+    try:
+        from vllm.model_executor.layers.fused_moe.ck_moe_padded import (
+            ck_mxfp4_w4a8_experts,
+        )
+        logger.info("CK MoE with padding loaded successfully")
+    except ImportError as e:
+        logger.warning("CK MoE import failed: %s. Falling back to Triton.", e)
+        USE_CK_MOE = False
+
+USE_ASM_MOE = os.environ.get("VLLM_USE_ASM_MOE", "0") == "1"
+if USE_ASM_MOE:
+    logger.info("ASM MoE (fused_moe_1stage) enabled")
 
 use_legacy_triton_kernels = False
 
@@ -189,6 +205,27 @@ def triton_kernel_moe_forward(
         and quant_config.use_mxfp4_w4a8
         and rocm_aiter_ops.is_enabled()
     ):
+        if USE_ASM_MOE:
+            return _asm_moe_1stage_forward(
+                hidden_states, w1, w2,
+                gating_output, topk, renormalize,
+                quant_config=quant_config,
+            )
+
+        if USE_CK_MOE:
+            return ck_mxfp4_w4a8_experts(
+                hidden_states, w1, w2,
+                gating_output, topk, renormalize,
+                quant_config=quant_config,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                unpadded_N_w1=unpadded_N_w1,
+                unpadded_K_w1=unpadded_K_w1,
+                unpadded_N_w2=unpadded_N_w2,
+                unpadded_K_w2=unpadded_K_w2,
+            )
+
         from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
 
         routing_data, gather_idx, scatter_idx = aiter_routing(
@@ -820,3 +857,80 @@ class UnfusedOAITritonExperts(BaseOAITritonExperts):
         )
 
         self.moe_sum(intermediate_cache3.view(-1, topk, K), output)
+
+
+def _asm_moe_1stage_forward(
+    hidden_states: torch.Tensor,
+    w1,
+    w2,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    quant_config=None,
+):
+    """Dispatch MoE through AITER's fused_moe_1stage (ASM fmoe_g1u1 kernel).
+
+    This kernel fuses activation quantization, stage1 (gate+up), SiGLU,
+    stage2 (down), and output combination into a single kernel launch.
+    Weights must be in [E, N, K_packed] format (row-major).
+    """
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe_1stage, moe_sorting
+
+    M = hidden_states.shape[0]
+    model_dim = hidden_states.shape[-1]
+
+    w1_data = w1.storage.data if hasattr(w1, 'storage') else w1
+    w2_data = w2.storage.data if hasattr(w2, 'storage') else w2
+
+    # Weights are stored col-major [E, K_packed, N] in vLLM.
+    # fused_moe_1stage expects [E, N, K_packed].
+    # Transpose to get the correct layout.
+    w1_t = w1_data.transpose(1, 2).contiguous().view(torch.float4_e2m1fn_x2)
+    w2_t = w2_data.transpose(1, 2).contiguous().view(torch.float4_e2m1fn_x2)
+
+    w1_scale = quant_config.w1_precision.weight_scale.storage.data
+    w2_scale = quant_config.w2_precision.weight_scale.storage.data
+    E = w1_data.shape[0]
+
+    sm_first = not renormalize
+    logits = gating_output
+    if sm_first:
+        logits = torch.softmax(logits.float(), dim=-1)
+    else:
+        logits = logits.float()
+    topk_vals, topk_ids = torch.topk(logits, k=topk, dim=-1)
+    if not sm_first:
+        topk_weights = torch.softmax(topk_vals, dim=-1)
+    else:
+        topk_weights = topk_vals
+    topk_weights = topk_weights.to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
+
+    block_m = 32
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = \
+        moe_sorting(topk_ids, topk_weights, E, block_m, None)
+
+    moe_out = torch.empty(M, model_dim, dtype=hidden_states.dtype,
+                          device=hidden_states.device)
+
+    fused_moe_1stage(
+        hidden_states=hidden_states,
+        w1=w1_t, w2=w2_t,
+        topk=topk,
+        sorted_ids=sorted_ids,
+        sorted_weights=sorted_weights,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        moe_buf=moe_out,
+        isG1U1=True,
+        block_size_M=block_m,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x32,
+        q_dtype_a=torch.float4_e2m1fn_x2,
+        q_dtype_w=torch.float4_e2m1fn_x2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+    )
+
+    return moe_out
