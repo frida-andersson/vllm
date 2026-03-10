@@ -889,8 +889,8 @@ def _asm_moe_1stage_forward(
     w1_t = w1_data.transpose(1, 2).contiguous().view(torch.float4_e2m1fn_x2)
     w2_t = w2_data.transpose(1, 2).contiguous().view(torch.float4_e2m1fn_x2)
 
-    w1_scale = quant_config.w1_precision.weight_scale.storage.data
-    w2_scale = quant_config.w2_precision.weight_scale.storage.data
+    w1_scale = quant_config.w1_precision.weight_scale.storage.data.contiguous()
+    w2_scale = quant_config.w2_precision.weight_scale.storage.data.contiguous()
     E = w1_data.shape[0]
 
     sm_first = not renormalize
