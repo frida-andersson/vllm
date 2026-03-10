@@ -913,7 +913,7 @@ def _asm_moe_1stage_forward(
     from aiter.ops.triton.utils.moe_config_utils import (
         get_optimal_moe_config_func,
     )
-    from aiter.fused_moe import moe_sorting, fp4_utils
+    from aiter.fused_moe import fp4_utils
 
     M = hidden_states.shape[0]
     model_dim = hidden_states.shape[-1]
@@ -952,8 +952,13 @@ def _asm_moe_1stage_forward(
     config = config_func(M)
     block_m = config["BLOCK_SIZE_M"]
 
-    sorted_ids, sorted_weights_s, sorted_expert_ids, num_valid_ids, _ = \
-        moe_sorting(topk_ids, topk_weights.to(torch.float32), E, block_m, None)
+    # Use vLLM's align_block_size for routing (matches fused_moe_mxfp4 expectations)
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_m, E,
+    )
 
     # Quantize activations to MXFP4
     a1, a1_scale = fp4_utils.dynamic_mxfp4_quant(hidden_states)
@@ -971,12 +976,11 @@ def _asm_moe_1stage_forward(
         dummy_a_scale, dummy_b_scale,
         a1_scale_u8, w1_scale.view(torch.uint8),
         topk_weights.to(torch.float16), topk_ids,
-        sorted_ids, sorted_expert_ids, num_valid_ids,
+        sorted_ids, expert_ids, num_tokens_post_padded,
         False, topk, False, False, config, tl_bf16,
     )
 
     # Stage 2: down projection
-    # Quantize intermediate
     a2, a2_scale = fp4_utils.dynamic_mxfp4_quant(c_silu)
     a2_u8 = a2.view(torch.uint8)
     a2_scale_u8 = a2_scale.view(torch.uint8)
@@ -987,10 +991,10 @@ def _asm_moe_1stage_forward(
         dummy_a_scale, dummy_b_scale,
         a2_scale_u8, w2_scale.view(torch.uint8),
         topk_weights.to(torch.float16), topk_ids,
-        sorted_ids, sorted_expert_ids, num_valid_ids,
+        sorted_ids, expert_ids, num_tokens_post_padded,
         True, topk, False, False, config, tl_bf16,
     )
 
-    # Sum over topk experts
+    # Weighted sum over topk experts
     moe_out = c_out.sum(dim=1)
     return moe_out
