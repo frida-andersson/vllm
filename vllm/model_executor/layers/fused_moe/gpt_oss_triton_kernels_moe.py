@@ -859,6 +859,39 @@ class UnfusedOAITritonExperts(BaseOAITritonExperts):
         self.moe_sum(intermediate_cache3.view(-1, topk, K), output)
 
 
+_cdna4_unswizzle_cache: dict = {}
+
+
+def _unswizzle_cdna4_scale(data):
+    """Reverse CDNA4 scale swizzle: [E, SCALE_K*32, N//32] -> [E, N, SCALE_K]."""
+    key = data.data_ptr()
+    if key in _cdna4_unswizzle_cache:
+        return _cdna4_unswizzle_cache[key]
+    E, SK32, Nd32 = data.shape
+    N = Nd32 * 32
+    SK = SK32 // 32
+    d = data.transpose(-1, -2)
+    d = d.reshape(E, N // 32, SK // 8, 4, 16, 2, 2, 1)
+    d = d.permute(0, 1, 6, 4, 2, 5, 3, 7).contiguous()
+    result = d.reshape(E, N, SK)
+    _cdna4_unswizzle_cache[key] = result
+    return result
+
+
+_weight_transpose_cache: dict = {}
+
+
+def _get_transposed_weight(w):
+    """Cache [E, K_packed, N] -> [E, N, K_packed] transpose."""
+    key = w.data_ptr()
+    if key in _weight_transpose_cache:
+        return _weight_transpose_cache[key]
+    data = w.storage.data if hasattr(w, 'storage') else w
+    result = data.transpose(1, 2).contiguous()
+    _weight_transpose_cache[key] = result
+    return result
+
+
 def _asm_moe_1stage_forward(
     hidden_states: torch.Tensor,
     w1,
@@ -868,31 +901,40 @@ def _asm_moe_1stage_forward(
     renormalize: bool,
     quant_config=None,
 ):
-    """Dispatch MoE through AITER's fused_moe_1stage (ASM fmoe_g1u1 kernel).
+    """Dispatch MoE through AITER's fused_moe_mxfp4 Triton kernels.
 
-    This kernel fuses activation quantization, stage1 (gate+up), SiGLU,
-    stage2 (down), and output combination into a single kernel launch.
-    Weights must be in [E, N, K_packed] format (row-major).
+    Uses fused_moe_mxfp4_silu for stage1 (gate+up+SiGLU) and
+    fused_moe_mxfp4 for stage2 (down projection).
+    Weights: [E, N, K_packed] uint8 with unswizzled scales [E, N, K//32].
     """
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe_1stage, moe_sorting
+    from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
+    from aiter.ops.triton.moe.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
+    from aiter.ops.triton.utils.types import torch_to_triton_dtype
+    from aiter.ops.triton.utils.moe_config_utils import (
+        get_optimal_moe_config_func,
+    )
+    from aiter.fused_moe import moe_sorting, fp4_utils
 
     M = hidden_states.shape[0]
     model_dim = hidden_states.shape[-1]
+    device = hidden_states.device
 
-    w1_data = w1.storage.data if hasattr(w1, 'storage') else w1
-    w2_data = w2.storage.data if hasattr(w2, 'storage') else w2
+    # Transpose weights: vLLM stores [E, K_packed, N], kernel needs [E, N, K_packed]
+    w1_t = _get_transposed_weight(w1)  # [E, N_w1, K_packed]
+    w2_t = _get_transposed_weight(w2)  # [E, N_w2, K_packed]
 
-    # Weights are stored col-major [E, K_packed, N] in vLLM.
-    # fused_moe_1stage expects [E, N, K_packed].
-    # Transpose to get the correct layout.
-    w1_t = w1_data.transpose(1, 2).contiguous().view(torch.float4_e2m1fn_x2)
-    w2_t = w2_data.transpose(1, 2).contiguous().view(torch.float4_e2m1fn_x2)
+    E = w1_t.shape[0]
+    N_w1 = w1_t.shape[1]  # 2 * inter_dim
+    N_w2 = w2_t.shape[1]  # model_dim
+    inter_dim = N_w1 // 2
 
-    w1_scale = quant_config.w1_precision.weight_scale.storage.data.contiguous()
-    w2_scale = quant_config.w2_precision.weight_scale.storage.data.contiguous()
-    E = w1_data.shape[0]
+    # Unswizzle CDNA4 scales to original [E, N, K//32] format
+    w1_scale_cdna4 = quant_config.w1_precision.weight_scale.storage.data
+    w2_scale_cdna4 = quant_config.w2_precision.weight_scale.storage.data
+    w1_scale = _unswizzle_cdna4_scale(w1_scale_cdna4)
+    w2_scale = _unswizzle_cdna4_scale(w2_scale_cdna4)
 
+    # Routing
     sm_first = not renormalize
     logits = gating_output
     if sm_first:
@@ -904,33 +946,51 @@ def _asm_moe_1stage_forward(
         topk_weights = torch.softmax(topk_vals, dim=-1)
     else:
         topk_weights = topk_vals
-    topk_weights = topk_weights.to(torch.float32)
     topk_ids = topk_ids.to(torch.int32)
 
-    block_m = 32
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = \
-        moe_sorting(topk_ids, topk_weights, E, block_m, None)
+    config_func = get_optimal_moe_config_func(torch.bfloat16, use_mxfp4=True)
+    config = config_func(M)
+    block_m = config["BLOCK_SIZE_M"]
 
-    moe_out = torch.empty(M, model_dim, dtype=hidden_states.dtype,
-                          device=hidden_states.device)
+    sorted_ids, sorted_weights_s, sorted_expert_ids, num_valid_ids, _ = \
+        moe_sorting(topk_ids, topk_weights.to(torch.float32), E, block_m, None)
 
-    fused_moe_1stage(
-        hidden_states=hidden_states,
-        w1=w1_t, w2=w2_t,
-        topk=topk,
-        sorted_ids=sorted_ids,
-        sorted_weights=sorted_weights,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        moe_buf=moe_out,
-        isG1U1=True,
-        block_size_M=block_m,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.per_1x32,
-        q_dtype_a=torch.float4_e2m1fn_x2,
-        q_dtype_w=torch.float4_e2m1fn_x2,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
+    # Quantize activations to MXFP4
+    a1, a1_scale = fp4_utils.dynamic_mxfp4_quant(hidden_states)
+    a1_u8 = a1.view(torch.uint8)
+    a1_scale_u8 = a1_scale.view(torch.uint8)
+
+    dummy_a_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+    dummy_b_scale = torch.ones(E, dtype=torch.float32, device=device)
+    tl_bf16 = torch_to_triton_dtype[torch.bfloat16]
+
+    # Stage 1: gate+up with SiGLU fused -> [M*topk, inter_dim]
+    c_silu = torch.zeros(M * topk, inter_dim, dtype=torch.bfloat16, device=device)
+    fused_moe_mxfp4_silu(
+        a1_u8, w1_t, c_silu,
+        dummy_a_scale, dummy_b_scale,
+        a1_scale_u8, w1_scale.view(torch.uint8),
+        topk_weights.to(torch.float16), topk_ids,
+        sorted_ids, sorted_expert_ids, num_valid_ids,
+        False, topk, False, False, config, tl_bf16,
     )
 
+    # Stage 2: down projection
+    # Quantize intermediate
+    a2, a2_scale = fp4_utils.dynamic_mxfp4_quant(c_silu)
+    a2_u8 = a2.view(torch.uint8)
+    a2_scale_u8 = a2_scale.view(torch.uint8)
+
+    c_out = torch.zeros(M, topk, N_w2, dtype=torch.bfloat16, device=device)
+    fused_moe_mxfp4(
+        a2_u8, w2_t, c_out,
+        dummy_a_scale, dummy_b_scale,
+        a2_scale_u8, w2_scale.view(torch.uint8),
+        topk_weights.to(torch.float16), topk_ids,
+        sorted_ids, sorted_expert_ids, num_valid_ids,
+        True, topk, False, False, config, tl_bf16,
+    )
+
+    # Sum over topk experts
+    moe_out = c_out.sum(dim=1)
     return moe_out
