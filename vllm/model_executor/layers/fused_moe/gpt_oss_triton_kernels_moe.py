@@ -998,4 +998,4 @@ def _asm_moe_1stage_forward(
          sorted_ids, sorted_expert_ids, sorted_weights.view(-1).contiguous(),
          num_valid_ids, bias_1d, M, model_dim, inter_dim, int(blocks), stream_ptr)
 
-    return out_s2
+    return out_s2.to(hidden_states.dtype)
