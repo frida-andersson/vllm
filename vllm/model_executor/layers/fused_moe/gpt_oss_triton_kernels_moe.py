@@ -906,24 +906,9 @@ def _prepare_flydsl_weight(w, scale_cdna4, gate_up):
     return result
 
 
-def _f32_scale_to_e8m0(scale_f32):
-    """Convert a scalar fp32 scale to e8m0 uint8 value.
-
-    e8m0 encoding: value = 2^(uint8_val - 127).
-    So uint8_val = round(log2(scale_f32)) + 127.
-    """
-    import math
-    log2_val = math.log2(abs(float(scale_f32)))
-    e8m0_val = max(0, min(255, round(log2_val) + 127))
-    return e8m0_val
-
-
-def _get_flydsl_buffers(M, topk, model_dim, inter_dim, device,
-                        a1_scale_f32=None, a2_scale_f32=None):
+def _get_flydsl_buffers(M, topk, model_dim, inter_dim, device):
     """Get or create pre-allocated buffers for FlyDSL forward pass."""
-    key = (M, topk, model_dim, inter_dim,
-           float(a1_scale_f32) if a1_scale_f32 is not None else 1.0,
-           float(a2_scale_f32) if a2_scale_f32 is not None else 1.0)
+    key = (M, topk, model_dim, inter_dim)
     if key in _flydsl_buf_cache:
         bufs = _flydsl_buf_cache[key]
         bufs["out_s2"].zero_()
@@ -931,21 +916,9 @@ def _get_flydsl_buffers(M, topk, model_dim, inter_dim, device,
 
     from tests.kernels.utils.fp4_utils import fp8_e8m0
 
-    if a1_scale_f32 is not None:
-        e8m0_a1 = _f32_scale_to_e8m0(a1_scale_f32)
-    else:
-        e8m0_a1 = 127  # 2^0 = 1.0
-
-    if a2_scale_f32 is not None:
-        e8m0_a2 = _f32_scale_to_e8m0(a2_scale_f32)
-    else:
-        e8m0_a2 = 127
-
     bufs = {
-        "scale_x": torch.full((M * (model_dim // 32),), e8m0_a1,
-                              dtype=torch.uint8, device=device).view(fp8_e8m0),
-        "a2_scale": torch.full((M * topk * (inter_dim // 32),), e8m0_a2,
-                               dtype=torch.uint8, device=device).view(fp8_e8m0),
+        "scale_x": torch.ones(M * (model_dim // 32), dtype=fp8_e8m0, device=device),
+        "a2_scale": torch.ones(M * topk * (inter_dim // 32), dtype=fp8_e8m0, device=device),
         "out_s1": torch.empty((M, topk, inter_dim), device=device, dtype=torch.float16),
         "out_s2": torch.zeros((M, model_dim), device=device, dtype=torch.float16),
         "bias_1d": torch.empty((0,), device=device, dtype=torch.float32),
@@ -969,11 +942,9 @@ def _asm_moe_1stage_forward(
     Stage2 (down projection): FP8 activations x MXFP4 weights
     Uses Quark's native MXFP4 weights directly (no dequant/requant).
     Weights are shuffled once and cached. Buffers are pre-allocated.
-    Activation scale from quant_config is applied via downcast_to_static_fp8.
     """
     from kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2
     from aiter.fused_moe import fused_topk, moe_sorting
-    from aiter.ops.triton.quant_moe import downcast_to_static_fp8
 
     M = hidden_states.shape[0]
     model_dim = hidden_states.shape[-1]
@@ -1018,25 +989,20 @@ def _asm_moe_1stage_forward(
         _flydsl_exe_cache[exe_key] = (exe1, exe2)
     exe1, exe2 = _flydsl_exe_cache[exe_key]
 
-    # Get activation scales from quant_config
-    a1_scale = quant_config.w1_precision.flex_ctx.lhs_data.scale
-    a2_scale_val = quant_config.w2_precision.flex_ctx.lhs_data.scale
-
-    # Pre-allocated buffers with correct e8m0 activation scales
-    bufs = _get_flydsl_buffers(M, topk, model_dim, inter_dim, device,
-                               a1_scale_f32=a1_scale, a2_scale_f32=a2_scale_val)
+    # Pre-allocated buffers
+    bufs = _get_flydsl_buffers(M, topk, model_dim, inter_dim, device)
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
-    # Stage 1: scale bf16 activations to fp8 using the model's calibrated scale
-    x_fp8 = downcast_to_static_fp8(hidden_states, a1_scale)
+    # Stage 1: fp8 activations, fp4 weights
+    x_fp8 = hidden_states.to(DTYPE_FP8)
 
     exe1(bufs["out_s1"], x_fp8, w1_shuf, bufs["scale_x"], w1_s_shuf,
          sorted_ids, sorted_expert_ids, sorted_weights.view(-1).contiguous(),
          num_valid_ids, bufs["bias_1d"],
          M, inter_dim, model_dim, int(blocks), stream_ptr)
 
-    # Stage 2: scale stage1 output to fp8 using the model's calibrated scale
-    a2_fp8 = downcast_to_static_fp8(bufs["out_s1"].view(-1, inter_dim), a2_scale_val)
+    # Stage 2: fp8 intermediate, fp4 weights
+    a2_fp8 = bufs["out_s1"].to(DTYPE_FP8)
 
     exe2(bufs["out_s2"], a2_fp8.contiguous().view(M * topk, inter_dim),
          w2_shuf, bufs["a2_scale"], w2_s_shuf,
