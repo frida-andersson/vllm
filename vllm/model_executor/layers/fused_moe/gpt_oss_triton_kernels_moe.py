@@ -864,6 +864,44 @@ _flydsl_exe_cache: dict = {}
 _flydsl_buf_cache: dict = {}
 
 DTYPE_FP8 = torch.float8_e4m3fn
+_FP8_E4M3_MAX = 448.0
+
+
+def _dynamic_fp8_blockscale_quant(x, block_size=32):
+    """Quantize bf16/fp16 tensor to FP8 with per-block e8m0 scales.
+
+    For each block of 32 elements along the last dimension:
+    1. Compute max absolute value
+    2. Compute e8m0 scale = 2^floor(log2(max_abs / FP8_MAX))
+    3. Divide by scale, cast to FP8
+    4. Return (fp8_tensor, e8m0_scales)
+
+    This gives proper per-block dynamic range, matching how MXFP4
+    handles weight scales but for FP8 activations.
+    """
+    from tests.kernels.utils.fp4_utils import fp8_e8m0
+
+    shape = x.shape
+    M = x.shape[0]
+    K = x.shape[-1]
+    x_flat = x.reshape(-1, K).float()
+    rows = x_flat.shape[0]
+    n_blocks = K // block_size
+
+    x_blocks = x_flat.reshape(rows, n_blocks, block_size)
+    block_max = x_blocks.abs().amax(dim=-1)  # [rows, n_blocks]
+
+    scale_log2 = torch.floor(torch.log2(block_max / _FP8_E4M3_MAX + 1e-12))
+    scale_log2 = scale_log2.clamp(-127, 127)
+    e8m0_vals = (scale_log2 + 127).to(torch.uint8)  # [rows, n_blocks]
+
+    scales_f32 = torch.exp2(scale_log2)  # [rows, n_blocks]
+    scales_expanded = scales_f32.unsqueeze(-1).expand_as(x_blocks)
+
+    x_scaled = x_blocks / scales_expanded
+    x_fp8 = x_scaled.reshape(rows, K).to(DTYPE_FP8)
+
+    return x_fp8.reshape(shape), e8m0_vals.view(fp8_e8m0)
 
 
 def _unswizzle_cdna4_scale(data):
@@ -914,11 +952,7 @@ def _get_flydsl_buffers(M, topk, model_dim, inter_dim, device):
         bufs["out_s2"].zero_()
         return bufs
 
-    from tests.kernels.utils.fp4_utils import fp8_e8m0
-
     bufs = {
-        "scale_x": torch.ones(M * (model_dim // 32), dtype=fp8_e8m0, device=device),
-        "a2_scale": torch.ones(M * topk * (inter_dim // 32), dtype=fp8_e8m0, device=device),
         "out_s1": torch.empty((M, topk, inter_dim), device=device, dtype=torch.float16),
         "out_s2": torch.zeros((M, model_dim), device=device, dtype=torch.float16),
         "bias_1d": torch.empty((0,), device=device, dtype=torch.float32),
@@ -940,8 +974,7 @@ def _asm_moe_1stage_forward(
 
     Stage1 (gate+up+SiGLU): FP8 activations x MXFP4 weights
     Stage2 (down projection): FP8 activations x MXFP4 weights
-    Uses Quark's native MXFP4 weights directly (no dequant/requant).
-    Weights are shuffled once and cached. Buffers are pre-allocated.
+    Uses per-block dynamic FP8 quantization with e8m0 scales for activations.
     """
     from kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2
     from aiter.fused_moe import fused_topk, moe_sorting
@@ -962,7 +995,7 @@ def _asm_moe_1stage_forward(
     w1_shuf, w1_s_shuf = _prepare_flydsl_weight(w1, w1_scale_cdna4, gate_up=True)
     w2_shuf, w2_s_shuf = _prepare_flydsl_weight(w2, w2_scale_cdna4, gate_up=False)
 
-    # Routing: use fused_topk to combine softmax+topk into one call
+    # Routing
     topk_weights, topk_ids = fused_topk(
         hidden_states, gating_output, topk, renormalize)
     topk_ids_i32 = topk_ids.to(torch.int32)
@@ -989,23 +1022,24 @@ def _asm_moe_1stage_forward(
         _flydsl_exe_cache[exe_key] = (exe1, exe2)
     exe1, exe2 = _flydsl_exe_cache[exe_key]
 
-    # Pre-allocated buffers
     bufs = _get_flydsl_buffers(M, topk, model_dim, inter_dim, device)
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
-    # Stage 1: fp8 activations, fp4 weights
-    x_fp8 = hidden_states.to(DTYPE_FP8)
+    # Stage 1: per-block dynamic FP8 quantization of activations
+    x_fp8, scale_x = _dynamic_fp8_blockscale_quant(hidden_states)
 
-    exe1(bufs["out_s1"], x_fp8, w1_shuf, bufs["scale_x"], w1_s_shuf,
+    exe1(bufs["out_s1"], x_fp8, w1_shuf,
+         scale_x.view(-1).contiguous(), w1_s_shuf,
          sorted_ids, sorted_expert_ids, sorted_weights.view(-1).contiguous(),
          num_valid_ids, bufs["bias_1d"],
          M, inter_dim, model_dim, int(blocks), stream_ptr)
 
-    # Stage 2: fp8 intermediate, fp4 weights
-    a2_fp8 = bufs["out_s1"].to(DTYPE_FP8)
+    # Stage 2: per-block dynamic FP8 quantization of stage1 output
+    a2_fp8, a2_scale = _dynamic_fp8_blockscale_quant(
+        bufs["out_s1"].view(-1, inter_dim))
 
     exe2(bufs["out_s2"], a2_fp8.contiguous().view(M * topk, inter_dim),
-         w2_shuf, bufs["a2_scale"], w2_s_shuf,
+         w2_shuf, a2_scale.view(-1).contiguous(), w2_s_shuf,
          sorted_ids, sorted_expert_ids, sorted_weights.view(-1).contiguous(),
          num_valid_ids, bufs["bias_1d"],
          M, model_dim, inter_dim, int(blocks), stream_ptr)
