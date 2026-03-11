@@ -891,7 +891,7 @@ def _dynamic_fp8_blockscale_quant(x, block_size=32):
     x_blocks = x_flat.reshape(rows, n_blocks, block_size)
     block_max = x_blocks.abs().amax(dim=-1)  # [rows, n_blocks]
 
-    scale_log2 = torch.floor(torch.log2(block_max / _FP8_E4M3_MAX + 1e-12))
+    scale_log2 = torch.ceil(torch.log2(block_max / _FP8_E4M3_MAX + 1e-12))
     scale_log2 = scale_log2.clamp(-127, 127)
     e8m0_vals = (scale_log2 + 127).to(torch.uint8)  # [rows, n_blocks]
 
@@ -1002,7 +1002,8 @@ def _asm_moe_1stage_forward(
 
     tile_m = 32
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = \
-        moe_sorting(topk_ids_i32, topk_weights.to(torch.float32), E, tile_m, None)
+        moe_sorting(topk_ids_i32, topk_weights.to(torch.float32),
+                    E, model_dim, torch.float16, tile_m)
     blocks = sorted_expert_ids.shape[0]
 
     # Compile kernels (cached)
@@ -1025,8 +1026,10 @@ def _asm_moe_1stage_forward(
     bufs = _get_flydsl_buffers(M, topk, model_dim, inter_dim, device)
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
-    # Stage 1: per-block dynamic FP8 quantization of activations
-    x_fp8, scale_x = _dynamic_fp8_blockscale_quant(hidden_states)
+    # Stage 1: simple FP8 cast + ones scale (matching FlyDSL test fp8xfp4 path)
+    x_fp8 = hidden_states.to(DTYPE_FP8)
+    scale_x = torch.ones(M, model_dim // 32, device=device,
+                         dtype=torch.uint8).view(torch.float8_e8m0fnu)
 
     exe1(bufs["out_s1"], x_fp8, w1_shuf,
          scale_x.view(-1).contiguous(), w1_s_shuf,
@@ -1034,11 +1037,13 @@ def _asm_moe_1stage_forward(
          num_valid_ids, bufs["bias_1d"],
          M, inter_dim, model_dim, int(blocks), stream_ptr)
 
-    # Stage 2: per-block dynamic FP8 quantization of stage1 output
-    a2_fp8, a2_scale = _dynamic_fp8_blockscale_quant(
-        bufs["out_s1"].view(-1, inter_dim))
+    # Stage 2: simple FP8 cast + ones scale for stage1 output
+    a2_flat = bufs["out_s1"].view(M * topk, inter_dim)
+    a2_fp8 = a2_flat.to(DTYPE_FP8)
+    a2_scale = torch.ones(M * topk, inter_dim // 32, device=device,
+                          dtype=torch.uint8).view(torch.float8_e8m0fnu)
 
-    exe2(bufs["out_s2"], a2_fp8.contiguous().view(M * topk, inter_dim),
+    exe2(bufs["out_s2"], a2_fp8.contiguous(),
          w2_shuf, a2_scale.view(-1).contiguous(), w2_s_shuf,
          sorted_ids, sorted_expert_ids, sorted_weights.view(-1).contiguous(),
          num_valid_ids, bufs["bias_1d"],
