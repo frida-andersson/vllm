@@ -860,6 +860,10 @@ class UnfusedOAITritonExperts(BaseOAITritonExperts):
 
 
 _flydsl_cache: dict = {}
+_flydsl_exe_cache: dict = {}
+_flydsl_buf_cache: dict = {}
+
+DTYPE_FP8 = torch.float8_e4m3fn
 
 
 def _unswizzle_cdna4_scale(data):
@@ -902,7 +906,25 @@ def _prepare_flydsl_weight(w, scale_cdna4, gate_up):
     return result
 
 
-_flydsl_exe_cache: dict = {}
+def _get_flydsl_buffers(M, topk, model_dim, inter_dim, device):
+    """Get or create pre-allocated buffers for FlyDSL forward pass."""
+    key = (M, topk, model_dim, inter_dim)
+    if key in _flydsl_buf_cache:
+        bufs = _flydsl_buf_cache[key]
+        bufs["out_s2"].zero_()
+        return bufs
+
+    from tests.kernels.utils.fp4_utils import fp8_e8m0
+
+    bufs = {
+        "scale_x": torch.ones(M * (model_dim // 32), dtype=fp8_e8m0, device=device),
+        "a2_scale": torch.ones(M * topk * (inter_dim // 32), dtype=fp8_e8m0, device=device),
+        "out_s1": torch.empty((M, topk, inter_dim), device=device, dtype=torch.float16),
+        "out_s2": torch.zeros((M, model_dim), device=device, dtype=torch.float16),
+        "bias_1d": torch.empty((0,), device=device, dtype=torch.float32),
+    }
+    _flydsl_buf_cache[key] = bufs
+    return bufs
 
 
 def _asm_moe_1stage_forward(
@@ -916,14 +938,13 @@ def _asm_moe_1stage_forward(
 ):
     """Dispatch MoE through FlyDSL compile_moe_gemm1/gemm2 kernels.
 
-    Stage1 (gate+up+SiGLU): MXFP4 activations x MXFP4 weights
-    Stage2 (down projection): MXFP4 activations x MXFP4 weights
+    Stage1 (gate+up+SiGLU): FP8 activations x MXFP4 weights
+    Stage2 (down projection): FP8 activations x MXFP4 weights
     Uses Quark's native MXFP4 weights directly (no dequant/requant).
-    Weights are shuffled once and cached.
+    Weights are shuffled once and cached. Buffers are pre-allocated.
     """
     from kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2
-    from tests.kernels.utils.fp4_utils import fp8_e8m0
-    from aiter.fused_moe import moe_sorting, fp4_utils
+    from aiter.fused_moe import fused_topk, moe_sorting
 
     M = hidden_states.shape[0]
     model_dim = hidden_states.shape[-1]
@@ -941,16 +962,9 @@ def _asm_moe_1stage_forward(
     w1_shuf, w1_s_shuf = _prepare_flydsl_weight(w1, w1_scale_cdna4, gate_up=True)
     w2_shuf, w2_s_shuf = _prepare_flydsl_weight(w2, w2_scale_cdna4, gate_up=False)
 
-    # Routing
-    sm_first = not renormalize
-    logits = gating_output.float()
-    if sm_first:
-        logits = torch.softmax(logits, dim=-1)
-    topk_vals, topk_ids = torch.topk(logits, k=topk, dim=-1)
-    if not sm_first:
-        topk_weights = torch.softmax(topk_vals, dim=-1)
-    else:
-        topk_weights = topk_vals
+    # Routing: use fused_topk to combine softmax+topk into one call
+    topk_weights, topk_ids = fused_topk(
+        hidden_states, gating_output, topk, renormalize)
     topk_ids_i32 = topk_ids.to(torch.int32)
 
     tile_m = 32
@@ -958,7 +972,7 @@ def _asm_moe_1stage_forward(
         moe_sorting(topk_ids_i32, topk_weights.to(torch.float32), E, tile_m, None)
     blocks = sorted_expert_ids.shape[0]
 
-    # Compile kernels (cached by FlyDSL internally)
+    # Compile kernels (cached)
     exe_key = ("exe", model_dim, inter_dim, E, topk)
     if exe_key not in _flydsl_exe_cache:
         exe1 = compile_moe_gemm1(
@@ -975,26 +989,25 @@ def _asm_moe_1stage_forward(
         _flydsl_exe_cache[exe_key] = (exe1, exe2)
     exe1, exe2 = _flydsl_exe_cache[exe_key]
 
+    # Pre-allocated buffers
+    bufs = _get_flydsl_buffers(M, topk, model_dim, inter_dim, device)
     stream_ptr = torch.cuda.current_stream().cuda_stream
-    bias_1d = torch.empty((0,), device=device, dtype=torch.float32)
 
-    # Stage 1: fp8 activations, fp4 weights, ones activation scale
+    # Stage 1: fp8 activations, fp4 weights
     x_fp8 = hidden_states.to(DTYPE_FP8)
-    scale_x = torch.ones([M, model_dim // 32], dtype=fp8_e8m0, device=device)
-    out_s1 = torch.empty((M, topk, inter_dim), device=device, dtype=torch.float16)
 
-    exe1(out_s1, x_fp8, w1_shuf, scale_x.view(-1).contiguous(), w1_s_shuf,
+    exe1(bufs["out_s1"], x_fp8, w1_shuf, bufs["scale_x"], w1_s_shuf,
          sorted_ids, sorted_expert_ids, sorted_weights.view(-1).contiguous(),
-         num_valid_ids, bias_1d, M, inter_dim, model_dim, int(blocks), stream_ptr)
+         num_valid_ids, bufs["bias_1d"],
+         M, inter_dim, model_dim, int(blocks), stream_ptr)
 
-    # Stage 2: fp8 intermediate (direct cast), ones scale
-    a2_fp8 = out_s1.to(DTYPE_FP8)
-    a2_scale = torch.ones([M, topk, inter_dim // 32], dtype=fp8_e8m0, device=device)
-    out_s2 = torch.zeros((M, model_dim), device=device, dtype=torch.float16)
+    # Stage 2: fp8 intermediate, fp4 weights
+    a2_fp8 = bufs["out_s1"].to(DTYPE_FP8)
 
-    exe2(out_s2, a2_fp8.contiguous().view(M * topk, inter_dim), w2_shuf,
-         a2_scale.view(-1).contiguous(), w2_s_shuf,
+    exe2(bufs["out_s2"], a2_fp8.contiguous().view(M * topk, inter_dim),
+         w2_shuf, bufs["a2_scale"], w2_s_shuf,
          sorted_ids, sorted_expert_ids, sorted_weights.view(-1).contiguous(),
-         num_valid_ids, bias_1d, M, model_dim, inter_dim, int(blocks), stream_ptr)
+         num_valid_ids, bufs["bias_1d"],
+         M, model_dim, inter_dim, int(blocks), stream_ptr)
 
-    return out_s2.to(hidden_states.dtype)
+    return bufs["out_s2"].to(hidden_states.dtype)
