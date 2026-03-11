@@ -916,16 +916,15 @@ def _asm_moe_1stage_forward(
 ):
     """Dispatch MoE through FlyDSL compile_moe_gemm1/gemm2 kernels.
 
-    Stage1 (gate+up+SiGLU): fp8 activations x fp4 weights
-    Stage2 (down projection): fp8 activations x fp4 weights
+    Stage1 (gate+up+SiGLU): MXFP4 activations x MXFP4 weights
+    Stage2 (down projection): MXFP4 activations x MXFP4 weights
     Uses Quark's native MXFP4 weights directly (no dequant/requant).
     Weights are shuffled once and cached.
     """
     from kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2
     from tests.kernels.utils.fp4_utils import fp8_e8m0
-    from aiter.fused_moe import moe_sorting
+    from aiter.fused_moe import moe_sorting, fp4_utils
 
-    DTYPE_FP8 = torch.float8_e4m3fn
     M = hidden_states.shape[0]
     model_dim = hidden_states.shape[-1]
     device = hidden_states.device
