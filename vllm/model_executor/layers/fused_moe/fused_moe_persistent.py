@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Optimized MoE for MXFP4: reuses existing stage1 kernel but replaces
-stage2 + reduce_grouped with a single stage2 kernel that does atomic
-reduction inline, saving one kernel launch per MoE layer.
+"""Optimized MoE for MXFP4: reuses existing stage1 kernel, provides a
+stage2 kernel that applies routing weights inline (no separate gamma
+multiply), and uses the standard reduce_grouped for CUDA-graph-compatible
+topk reduction.
 
 Enable with VLLM_USE_FUSED_MOE=1.
 """
@@ -27,11 +28,12 @@ def _unswizzle_mx_scale_cdna4(
 
 
 @triton.jit
-def _moe_stage2_reduce(
-    Y,                # [M, N2] output, bf16, zero-initialized
+def _moe_stage2_weighted(
+    Y,                # [split_k, M_sorted, N2] output, expert-sorted
+    stride_y_k,
     stride_y_m,
     stride_y_n,
-    X,                # [total_sorted, K2] intermediate, FP8
+    X,                # [M_sorted, K2] intermediate, FP8
     stride_x_m,
     stride_x_k,
     W,                # [E, K2_packed, N2] weight, MXFP4
@@ -43,13 +45,11 @@ def _moe_stage2_reduce(
     stride_ws_k,
     stride_ws_n,
     X_static_scale,   # scalar fp32
-    Gammas,           # [total_sorted] routing weights, bf16
-    ScatterIndx,      # [total_sorted] -> output token index
+    Gammas,           # [M_sorted] routing weights, bf16
     ExptHist,
     ExptOffs,
     ExptData,
     N, K,
-    N_EXPTS_ACT: tl.constexpr,
     grid_m, grid_n,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -59,12 +59,11 @@ def _moe_stage2_reduce(
     MASK_K_LIMIT: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
 ):
-    """Stage2 GEMM with inline atomic reduction.
+    """Stage2 GEMM with routing weights applied inline.
 
-    Each block computes intermediate @ W2 for one expert's M-tile,
-    applies routing weight, and atomically adds to the output at
-    the correct token position (via ScatterIndx).
-    Eliminates the separate reduce_grouped kernel.
+    Writes to expert-sorted output buffer (no atomics).
+    Compatible with CUDA graph capture.
+    Uses reduce_grouped afterwards for topk reduction.
     """
     MX_PACK: tl.constexpr = 32
     MX_SBK: tl.constexpr = BLOCK_K // MX_PACK
@@ -75,9 +74,8 @@ def _moe_stage2_reduce(
     SBN: tl.constexpr = BLOCK_N // NKP
 
     pid = tl.program_id(0)
-    pid_mn = pid
-    pid_m = pid_mn // grid_n
-    pid_n = pid_mn % grid_n
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
 
     expt_data = tl.load(ExptData + pid_m)
     if expt_data == -1:
@@ -147,24 +145,18 @@ def _moe_stage2_reduce(
     if X_static_scale is not None:
         acc = acc * tl.load(X_static_scale)
 
-    # Apply routing weights
+    # Apply routing weights inline (fused with GEMM output)
     if Gammas is not None:
         gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         acc *= gammas[:, None]
 
-    # Scatter-reduce: atomic add to output at token positions
-    # ScatterIndx maps from expert-sorted to output token position
+    # Write to expert-sorted output (regular store, CUDA-graph compatible)
     offs_out_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_out_n < N
-
-    scatter_offs = start_m + offs_m_wrap
-    token_idxs = tl.load(ScatterIndx + scatter_offs, mask=mask_m, other=-1)
-    valid = mask_m & (token_idxs >= 0)
-
-    out_ptrs = (Y + token_idxs[:, None].to(tl.int64) * stride_y_m
-                + offs_out_n[None, :].to(tl.int64) * stride_y_n)
-    out_mask = valid[:, None] & mask_n[None, :]
-    tl.atomic_add(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)
+    Y_ptrs = (Y + (start_m + offs_m).to(tl.int64)[:, None] * stride_y_m
+              + offs_out_n[None, :].to(tl.int64) * stride_y_n)
+    mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(Y_ptrs, acc, mask=mask)
 
 
 def fused_moe_persistent(
@@ -183,14 +175,15 @@ def fused_moe_persistent(
     swiglu_limit: float = 7.0,
     **kwargs,
 ):
-    """Optimized MoE: stage1 (existing) + stage2 with inline reduction.
+    """Optimized MoE: stage1 (existing) + stage2 with inline routing weights.
 
-    Saves one kernel launch per layer by folding reduce_grouped into stage2.
+    Stage2 applies gammas inside the GEMM kernel (saves one pass over data).
+    Uses standard reduce_grouped for CUDA-graph-compatible topk reduction.
     """
     from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
     from aiter.ops.triton.quant_moe import downcast_to_static_fp8
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
-        moe_gemm_a8w4, get_kernel_config,
+        moe_gemm_a8w4, get_kernel_config, reduce_grouped, allocate_output,
     )
 
     assert quant_config is not None
@@ -224,7 +217,7 @@ def fused_moe_persistent(
         unpadded_N=unpadded_N_w1, unpadded_K=unpadded_K_w1,
     )
 
-    # Stage 2: custom kernel with inline atomic reduction
+    # Stage 2: our kernel with inline routing weights
     M = hidden_states.shape[0]
     N2 = w2_data.shape[-1]
     K2 = intermediate.shape[-1]
@@ -244,35 +237,27 @@ def fused_moe_persistent(
     grid_m = routing_data.n_blocks(M_route, BLOCK_M)
     grid_n = triton.cdiv(N2, BLOCK_N)
 
-    output = torch.zeros(
-        (M, N2), device=hidden_states.device, dtype=torch.bfloat16)
+    # Expert-sorted output (same layout as baseline stage2)
+    y_stage2 = torch.zeros(
+        (1, M_route, N2), device=hidden_states.device, dtype=torch.bfloat16)
+    y_final = torch.empty(
+        (M, N2), device=hidden_states.device, dtype=hidden_states.dtype)
 
     expt_data = routing_data.expt_data
     gammas_stage2 = None if apply_router_weight_on_input else gammas
 
-    # Build inverse scatter map: for each expert-sorted row, which output token?
-    # scatter_idx is [M * topk], scatter_idx.view(M, topk)[t, s] = expert-sorted row for token t, slot s
-    # We need inverse: expert_row -> token_idx
-    inv_scatter = torch.full((M_route,), -1, device=hidden_states.device, dtype=torch.int32)
-    scatter_view = scatter_idx.view(-1, topk)
-    for s in range(topk):
-        col = scatter_view[:, s]
-        valid = col >= 0
-        inv_scatter[col[valid].long()] = torch.arange(M, device=hidden_states.device, dtype=torch.int32)[valid]
-
-    _moe_stage2_reduce[(grid_m * grid_n,)](
-        output, output.stride(0), output.stride(1),
+    _moe_stage2_weighted[(grid_m * grid_n,)](
+        y_stage2,
+        y_stage2.stride(0), y_stage2.stride(1), y_stage2.stride(2),
         intermediate, intermediate.stride(0), intermediate.stride(1),
         w2_data, w2_data.stride(0), w2_data.stride(1), w2_data.stride(2),
         w2_scale, w2_scale.stride(0), w2_scale.stride(1), w2_scale.stride(2),
         a2_scale,
         gammas_stage2,
-        inv_scatter,
         expt_data.hist,
         expt_data.token_offs_raw,
         expt_data.block_pid_map,
         N2, K2,
-        N_EXPTS_ACT=topk,
         grid_m=grid_m, grid_n=grid_n,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         GROUP_M=config2["group_m"],
@@ -283,4 +268,12 @@ def fused_moe_persistent(
         num_stages=config2["num_stages"],
     )
 
-    return output.to(hidden_states.dtype)
+    # Reduce: sum topk expert contributions per token (CUDA-graph compatible)
+    group_indx = scatter_idx.view(-1, topk)
+    y_final = reduce_grouped(
+        y_stage2, group_indx, y_final,
+        False, swiglu_alpha, swiglu_limit, 1,
+        out_dtype=hidden_states.dtype,
+    )
+
+    return y_final
