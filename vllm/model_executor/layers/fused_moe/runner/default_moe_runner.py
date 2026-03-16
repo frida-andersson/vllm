@@ -24,6 +24,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
+from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+    inject_shared_expert_weights,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
@@ -516,6 +519,16 @@ class DefaultMoERunner(MoERunner):
                     router_logits=staged_router_logits,
                 )
 
+                topk_weights, topk_ids = inject_shared_expert_weights(
+                    topk_weights,
+                    topk_ids,
+                    topk=layer.top_k,
+                    num_fused_shared_experts=layer.num_fused_shared_experts,
+                    shared_expert_weights=getattr(
+                        layer, "_cached_shared_expert_weights", None
+                    ),
+                )
+
                 final_hidden_states = self.quant_method.apply(
                     layer=layer,
                     x=staged_hidden_states,
@@ -684,6 +697,16 @@ class DefaultMoERunner(MoERunner):
                 topk_weights, topk_ids = self.router.select_experts(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
+                )
+
+                topk_weights, topk_ids = inject_shared_expert_weights(
+                    topk_weights,
+                    topk_ids,
+                    topk=layer.top_k,
+                    num_fused_shared_experts=layer.num_fused_shared_experts,
+                    shared_expert_weights=getattr(
+                        layer, "_cached_shared_expert_weights", None
+                    ),
                 )
 
                 final_hidden_states = self.quant_method.apply(
