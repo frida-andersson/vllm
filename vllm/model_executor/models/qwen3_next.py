@@ -305,6 +305,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             else None,
         )
 
+        if self.is_fusion_moe_shared_experts_enabled:
+            self.experts._shared_expert_gate = self.shared_expert_gate
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
@@ -313,12 +316,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
-
-        if self.is_fusion_moe_shared_experts_enabled:
-            gate_logits, _ = self.shared_expert_gate(hidden_states)
-            self.experts._cached_shared_expert_weights = torch.sigmoid(
-                gate_logits
-            )
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
