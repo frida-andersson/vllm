@@ -1247,20 +1247,10 @@ class Qwen3NextModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Special handling: when AITER fusion_shared_experts is enabled,
-                # checkpoints may provide a single widened shared_experts tensor
-                # without explicit expert indices
-                # (e.g. ...mlp.shared_experts.gate_proj.weight).
-                # For models with multiple shared experts, split that tensor
-                # evenly into per-shared-expert slices and load them into
-                # appended expert slots mlp.experts.{n_routed_experts + j}.*
-                # accordingly.
+                name_mapped = name
                 num_chunks = 1
                 if is_fusion_moe_shared_experts_layer:
                     num_chunks = getattr(self.config, "n_shared_experts", 1) or 1
-                    # Determine split axis based on op type
-                    # gate/up: ColumnParallel → split along dim 0
-                    # down: RowParallel → split along dim 1
                     split_dim = (
                         1
                         if ("down_proj.weight" in name and loaded_weight.ndim > 1)
@@ -1285,8 +1275,6 @@ class Qwen3NextModel(nn.Module):
                             weight_to_load = loaded_weight[chunk_slice, :]
                         else:
                             weight_to_load = loaded_weight[:, chunk_slice]
-                        # Synthesize an expert-style name so expert mapping
-                        # can route it
                         chunk_name = name.replace(
                             "mlp.shared_expert",
                             f"mlp.experts.{self.config.num_experts + j}",
@@ -1294,36 +1282,30 @@ class Qwen3NextModel(nn.Module):
 
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
+                        if weight_name not in chunk_name:
                             continue
-                        name = name.replace(weight_name, param_name)
-                        # Skip layers on other devices.
-                        if is_pp_missing_parameter(name, self):
+                        mapped_name = chunk_name.replace(weight_name, param_name)
+                        if is_pp_missing_parameter(mapped_name, self):
                             continue
-                        # Skip loading extra bias for GPTQ models.
                         if (
-                            name.endswith(".bias") or name.endswith("_bias")
-                        ) and name not in params_dict:
+                            mapped_name.endswith(".bias") or mapped_name.endswith("_bias")
+                        ) and mapped_name not in params_dict:
                             continue
-                        if name not in params_dict:
+                        if mapped_name not in params_dict:
                             continue
-                        param = params_dict[name]
+                        param = params_dict[mapped_name]
                         weight_loader = param.weight_loader
-                        success = weight_loader(
+                        weight_loader(
                             param,
                             weight_to_load,
-                            name,
+                            mapped_name,
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
-                        if success:
-                            if not is_fusion_moe_shared_experts_layer:
-                                name = name_mapped
-                            else:
-                                loaded_params.add(name_mapped)
+                        if is_fusion_moe_shared_experts_layer:
+                            loaded_params.add(name_mapped)
                         break
                     else:
-                        # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
                         if is_pp_missing_parameter(name, self):
