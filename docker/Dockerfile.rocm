@@ -439,6 +439,16 @@ RUN echo "ROCTRACER_MAX_EVENTS=10000000" > ${COMMON_WORKDIR}/libkineto.conf
 ENV KINETO_CONFIG="${COMMON_WORKDIR}/libkineto.conf"
 RUN echo "VLLM_BASE_IMAGE=${BASE_IMAGE}" >> ${COMMON_WORKDIR}/versions.txt
 
+# Fix AITER mla_asm.csv: gfx950 Gqa=32 row has wrong kernel symbol (m64x1 -> m32x1).
+# The .co filename says 32mx1 but the kernel name says m64x1 — mismatch crashes MLA.
+RUN MLA_CSV=$(find /usr/local/lib -path '*/gfx950/mla/mla_asm.csv' 2>/dev/null | head -1) \
+    ; if [ -n "$MLA_CSV" ] && [ -f "$MLA_CSV" ]; then \
+        sed -i '/,32,/s/m64x1/m32x1/g' "$MLA_CSV" \
+        && echo "Patched mla_asm.csv ($MLA_CSV) for gfx950 Gqa=32"; \
+    else \
+        echo "mla_asm.csv not found (may not be needed for this AITER version)"; \
+    fi
+
 CMD ["/bin/bash"]
 
 #Set entrypoint for vllm-openai official images
