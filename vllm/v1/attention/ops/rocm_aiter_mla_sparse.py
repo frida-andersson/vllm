@@ -338,7 +338,11 @@ def rocm_fp8_paged_mqa_logits(
             "deepgemm_fp8_paged_mqa_logits",
             None,
         )
-        if _deepgemm_fp8_paged_mqa_logits is not None:
+        # The new API requires block_size > 1 for valid MFMA instruction shapes
+        use_new_api = (
+            _deepgemm_fp8_paged_mqa_logits is not None and block_size > 1
+        )
+        if use_new_api:
             out_logits = torch.full(
                 (batch_size * next_n, max_model_len),
                 float("-inf"),
