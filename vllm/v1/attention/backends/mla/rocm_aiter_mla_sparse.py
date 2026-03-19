@@ -84,6 +84,8 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8_e4m3",
+        "fp8_e5m2",
     ]
 
     @staticmethod
@@ -310,17 +312,29 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         assert indexer is not None
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
 
-    def _forward_bf16_kv(
+    def _forward_mla(
         self,
         q: torch.Tensor,  # [sq, heads, d_qk]
         kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
         topk_indices: torch.Tensor,  # [sq, topk]
         attn_metadata: ROCMAiterMLASparseMetadata,
+        layer: AttentionLayer | None = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
+        attn_out_dtype = q.dtype
+
+        is_fp8_kv = self.kv_cache_dtype.startswith("fp8")
+        if is_fp8_kv:
+            from vllm.platforms import current_platform
+            fp8_dtype = current_platform.fp8_dtype()
+            q_scale = layer.k_scale if layer is not None else None
+            k_scale = layer.k_scale if layer is not None else None
+            q = q.to(fp8_dtype)
+            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(fp8_dtype)
+
         output = torch.empty(
             [num_tokens, self.num_heads, self.kv_lora_rank],
-            dtype=q.dtype,
+            dtype=attn_out_dtype,
             device=q.device,
         )
         seq_len = (topk_indices != -1).sum(dim=-1)
@@ -333,17 +347,32 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             attn_metadata.topk_tokens,
         )
 
-        rocm_aiter_ops.mla_decode_fwd(
-            q,
-            kv_c_and_k_pe_cache,
-            output,
-            self.scale,
-            attn_metadata.qo_indptr,
-            1,
-            attn_metadata.paged_kv_indptr,
-            attn_metadata.paged_kv_indices,
-            attn_metadata.paged_kv_last_page_len,
-        )
+        if is_fp8_kv:
+            rocm_aiter_ops.mla_decode_fwd(
+                q,
+                kv_c_and_k_pe_cache,
+                output,
+                self.scale,
+                attn_metadata.qo_indptr,
+                1,
+                attn_metadata.paged_kv_indptr,
+                attn_metadata.paged_kv_indices,
+                attn_metadata.paged_kv_last_page_len,
+                q_scale,
+                k_scale,
+            )
+        else:
+            rocm_aiter_ops.mla_decode_fwd(
+                q,
+                kv_c_and_k_pe_cache,
+                output,
+                self.scale,
+                attn_metadata.qo_indptr,
+                1,
+                attn_metadata.paged_kv_indptr,
+                attn_metadata.paged_kv_indices,
+                attn_metadata.paged_kv_last_page_len,
+            )
 
         return output[:, : self.num_heads, :]
 
@@ -375,8 +404,8 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
         )
 
-        attn_out = self._forward_bf16_kv(
-            q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
+        attn_out = self._forward_mla(
+            q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata, layer
         )
 
         return attn_out, None

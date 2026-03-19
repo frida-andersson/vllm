@@ -109,7 +109,7 @@ def indexer_k_quant_and_cache_triton(
         block_size,
         num_tokens,
         head_dim,
-        "NHD",
+        "SHUFFLE",
         block_tile_size,
         head_tile_size,
         IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
@@ -210,7 +210,7 @@ def cp_gather_indexer_k_quant_cache_triton(
         block_table_stride,
         k_cache_value.stride(0),
         k_cache_scale.stride(0),
-        "NHD",
+        "SHUFFLE",
         head_dim,
         block_tile_size,
         head_tile_size,
@@ -281,6 +281,7 @@ def rocm_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: torch.Tensor,
     max_model_len: int,
+    block_size: int = 1,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -298,6 +299,7 @@ def rocm_fp8_paged_mqa_logits(
         schedule_metadata: Returned by `get_paged_mqa_logits_metadata`;
             used to distribute work across SMs.
         max_model_len: Maximum sequence length used to size the logits output.
+        block_size: KV cache block size (default 1).
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -329,26 +331,54 @@ def rocm_fp8_paged_mqa_logits(
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
-        deepgemm_fp8_paged_mqa_logits_stage1 = (
-            aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
-        )
         batch_size, next_n, heads, _ = q_fp8.shape
-        out_qk = torch.full(
-            (heads, batch_size * next_n, max_model_len),
-            float("-inf"),
-            device="cuda",
-            dtype=torch.float32,
+        _deepgemm_fp8_paged_mqa_logits = getattr(
+            aiter_paged_mqa_logits_module,
+            "deepgemm_fp8_paged_mqa_logits",
+            None,
         )
-        deepgemm_fp8_paged_mqa_logits_stage1(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            out_qk,
-            context_lens,
-            block_tables,
-            max_model_len,
-        )
-        return out_qk.sum(dim=0)
+        if _deepgemm_fp8_paged_mqa_logits is not None:
+            out_logits = torch.full(
+                (batch_size * next_n, max_model_len),
+                float("-inf"),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            _deepgemm_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                out_logits,
+                context_lens,
+                block_tables,
+                max_model_len,
+                ChunkK=256,
+                Preshuffle=block_size == 64,
+                KVBlockSize=block_size,
+                WavePerEU=2,
+            )
+            return out_logits
+        else:
+            _stage1 = (
+                aiter_paged_mqa_logits_module
+                .deepgemm_fp8_paged_mqa_logits_stage1
+            )
+            out_qk = torch.full(
+                (heads, batch_size * next_n, max_model_len),
+                float("-inf"),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            _stage1(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                out_qk,
+                context_lens,
+                block_tables,
+                max_model_len,
+            )
+            return out_qk.sum(dim=0)
     else:
         return fp8_paged_mqa_logits_torch(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
@@ -529,7 +559,7 @@ def rocm_aiter_sparse_attn_indexer(
     has_prefill = attn_metadata.num_prefills > 0
     num_decode_tokens = attn_metadata.num_decode_tokens
 
-    ops.indexer_k_quant_and_cache(
+    indexer_k_quant_and_cache_triton(
         k,
         kv_cache,
         slot_mapping,
@@ -552,12 +582,13 @@ def rocm_aiter_sparse_attn_indexer(
                 dtype=torch.uint8,
             )
 
-            ops.cp_gather_indexer_k_quant_cache(
+            cp_gather_indexer_k_quant_cache_triton(
                 kv_cache,
                 k_fp8,
                 k_scale,
                 chunk.block_table,
                 chunk.cu_seq_lens,
+                chunk.token_to_seq,
             )
 
             logits = rocm_fp8_mqa_logits(
@@ -585,6 +616,7 @@ def rocm_aiter_sparse_attn_indexer(
 
     if has_decode:
         decode_metadata = attn_metadata.decode
+        kv_block_size = kv_cache.shape[1]
         # kv_cache size requirement [num_block, block_size, n_head, head_dim],
         # we only have [num_block, block_size, head_dim],
         kv_cache = kv_cache.unsqueeze(-2)
@@ -615,6 +647,7 @@ def rocm_aiter_sparse_attn_indexer(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            block_size=kv_block_size,
         )
 
         num_rows = logits.shape[0]
