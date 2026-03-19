@@ -15,6 +15,26 @@ if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
 
 
+@functools.lru_cache
+def _paged_mqa_logits_module():
+    paged_mqa_logits_module_path = None
+    if importlib.util.find_spec("aiter.ops.triton.pa_mqa_logits") is not None:
+        paged_mqa_logits_module_path = "aiter.ops.triton.pa_mqa_logits"
+    elif (
+        importlib.util.find_spec("aiter.ops.triton.attention.pa_mqa_logits")
+        is not None
+    ):
+        paged_mqa_logits_module_path = "aiter.ops.triton.attention.pa_mqa_logits"
+
+    if paged_mqa_logits_module_path is not None:
+        try:
+            module = importlib.import_module(paged_mqa_logits_module_path)
+            return module
+        except ImportError:
+            return None
+    return None
+
+
 @triton.jit
 def _indexer_k_quant_and_cache_kernel(
     k_ptr,  # [num_tokens, head_dim]
@@ -307,28 +327,9 @@ def rocm_fp8_paged_mqa_logits(
     """
     from vllm._aiter_ops import rocm_aiter_ops
 
-    @functools.lru_cache
-    def paged_mqa_logits_module():
-        paged_mqa_logits_module_path = None
-        if importlib.util.find_spec("aiter.ops.triton.pa_mqa_logits") is not None:
-            paged_mqa_logits_module_path = "aiter.ops.triton.pa_mqa_logits"
-        elif (
-            importlib.util.find_spec("aiter.ops.triton.attention.pa_mqa_logits")
-            is not None
-        ):
-            paged_mqa_logits_module_path = "aiter.ops.triton.attention.pa_mqa_logits"
-
-        if paged_mqa_logits_module_path is not None:
-            try:
-                module = importlib.import_module(paged_mqa_logits_module_path)
-                return module
-            except ImportError:
-                return None
-        return None
-
     aiter_paged_mqa_logits_module = None
     if rocm_aiter_ops.is_enabled():
-        aiter_paged_mqa_logits_module = paged_mqa_logits_module()
+        aiter_paged_mqa_logits_module = _paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
         batch_size, next_n, heads, _ = q_fp8.shape
