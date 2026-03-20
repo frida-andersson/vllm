@@ -439,9 +439,25 @@ RUN echo "ROCTRACER_MAX_EVENTS=10000000" > ${COMMON_WORKDIR}/libkineto.conf
 ENV KINETO_CONFIG="${COMMON_WORKDIR}/libkineto.conf"
 RUN echo "VLLM_BASE_IMAGE=${BASE_IMAGE}" >> ${COMMON_WORKDIR}/versions.txt
 
+# Upgrade AITER to latest from source with gfx950 MoE fix.
+# The base image ships AITER v0.1.10.post2 which lacks gfx950 tuned configs
+# and has a 2-stage CK MoE crash on gfx950. Install from our patched fork
+# (https://github.com/ROCm/aiter/pull/2374) until merged upstream.
+ARG AITER_REPO="https://github.com/maeehart/aiter.git"
+ARG AITER_BRANCH="maeehart/fix-fmoe-1stage-gfx950"
+ENV MAX_JOBS=8
+RUN pip uninstall -y amd-aiter 2>/dev/null; \
+    rm -rf /app/aiter && \
+    git clone --depth 1 -b ${AITER_BRANCH} ${AITER_REPO} /app/aiter && \
+    cd /app/aiter && \
+    git submodule update --init --recursive && \
+    pip install ninja pandas && \
+    GPU_ARCHS="gfx942;gfx950" pip install -e . --no-build-isolation 2>&1 | tail -50 && \
+    python3 -c "import aiter; print('AITER upgraded:', aiter.__file__)"
+
 # Fix AITER mla_asm.csv: gfx950 Gqa=32 row has wrong kernel symbol (m64x1 -> m32x1).
 # The .co filename says 32mx1 but the kernel name says m64x1 — mismatch crashes MLA.
-RUN MLA_CSV=$(find /usr/local/lib -path '*/gfx950/mla/mla_asm.csv' 2>/dev/null | head -1) \
+RUN MLA_CSV=$(find / -path '*/gfx950/mla/mla_asm.csv' 2>/dev/null | head -1) \
     ; if [ -n "$MLA_CSV" ] && [ -f "$MLA_CSV" ]; then \
         sed -i '/,32,/s/m64x1/m32x1/g' "$MLA_CSV" \
         && echo "Patched mla_asm.csv ($MLA_CSV) for gfx950 Gqa=32"; \
