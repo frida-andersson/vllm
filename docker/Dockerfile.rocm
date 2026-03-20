@@ -456,7 +456,7 @@ RUN pip uninstall -y amd-aiter 2>/dev/null; \
     cd /app/aiter && \
     git submodule update --init --recursive && \
     pip install ninja pandas && \
-    GPU_ARCHS="gfx942;gfx950" pip install -e . --no-build-isolation 2>&1 | tail -50 && \
+    GPU_ARCHS="gfx942;gfx950" PREBUILD_KERNELS=1 pip install -e . --no-build-isolation 2>&1 | tail -50 && \
     python3 -c "import aiter; print('AITER upgraded:', aiter.__file__)"
 
 # Fix AITER mla_asm.csv: gfx950 Gqa=32 row has wrong kernel symbol (m64x1 -> m32x1).
