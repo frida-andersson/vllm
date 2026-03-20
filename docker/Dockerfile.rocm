@@ -434,6 +434,10 @@ ENV SAFETENSORS_FAST_GPU=1
 # Performance environment variable.
 ENV HIP_FORCE_DEV_KERNARG=1
 
+# Enable AITER acceleration by default for ROCm builds.
+ENV VLLM_ROCM_USE_AITER=1
+ENV VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1
+
 # Workaround for ROCm profiler limits
 RUN echo "ROCTRACER_MAX_EVENTS=10000000" > ${COMMON_WORKDIR}/libkineto.conf
 ENV KINETO_CONFIG="${COMMON_WORKDIR}/libkineto.conf"

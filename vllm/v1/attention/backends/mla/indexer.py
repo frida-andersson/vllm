@@ -215,6 +215,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
+        if current_platform.is_rocm():
+            return AttentionCGSupport.UNIFORM_BATCH
         if not is_deep_gemm_supported():
             logger.warning_once(
                 "DeepGEMM is not available. Disabling CUDA graph support "
