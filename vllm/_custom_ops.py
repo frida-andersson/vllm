@@ -2219,7 +2219,12 @@ def wvSplitKQ(
 
 # moe
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
-    torch.ops._moe_C.moe_sum(input, output)
+    # Use torch.sum instead of the custom CUDA op so torch.compile/Inductor
+    # can fuse this reduction with surrounding operations.  The custom kernel
+    # only has specializations for topk <= 4 and falls back to at::sum_out
+    # for larger topk (e.g. DeepSeek V3.2 uses topk=8), which produces an
+    # opaque native_reduce_kernel that blocks fusion.
+    torch.sum(input, dim=1, out=output)
 
 
 def moe_align_block_size(
