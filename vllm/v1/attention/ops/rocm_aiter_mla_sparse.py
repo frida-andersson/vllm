@@ -2,36 +2,64 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 import importlib
+import importlib.util
+import os
 
 import torch
 
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 
+logger = init_logger(__name__)
+
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
 
 
+def _ensure_aiter_gluon_pa_mqa_logits_env() -> None:
+    """ROCm aiter: the fused Gluon path uses kernels named like
+    `_gluon_deepgemm_fp8_paged_mqa_logits` (see ROCm/aiter pa_mqa_logits.py).
+
+    `vllm.env_override` sets this before `import torch` when possible. This
+    duplicate keeps the env correct if this module is imported without going
+    through `import vllm` first. Must run before any `aiter.ops.triton.*.pa_mqa_logits`
+    import (see `vllm.env_override._maybe_set_aiter_gluon_pa_mqa_logits_env_early`).
+    """
+    key = "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS"
+    if os.environ.get(key, "").strip().lower() in ("0", "false", "no"):
+        return
+    os.environ[key] = "1"
+
+
+_ensure_aiter_gluon_pa_mqa_logits_env()
+
+
 @functools.lru_cache
 def _paged_mqa_logits_module():
-    paged_mqa_logits_module_path = None
-    if importlib.util.find_spec("aiter.ops.triton.pa_mqa_logits") is not None:
-        paged_mqa_logits_module_path = "aiter.ops.triton.pa_mqa_logits"
-    elif (
-        importlib.util.find_spec("aiter.ops.triton.attention.pa_mqa_logits")
-        is not None
-    ):
-        paged_mqa_logits_module_path = "aiter.ops.triton.attention.pa_mqa_logits"
+    """Load aiter pa_mqa_logits.
 
-    if paged_mqa_logits_module_path is not None:
+    Prefer `aiter.ops.triton.attention.pa_mqa_logits` (full API including
+    `deepgemm_fp8_paged_mqa_logits`) over the legacy `aiter.ops.triton.pa_mqa_logits`
+    shim, which can shadow the attention package and omit symbols.
+    """
+    _ensure_aiter_gluon_pa_mqa_logits_env()
+    candidates = (
+        "aiter.ops.triton.attention.pa_mqa_logits",
+        "aiter.ops.triton.pa_mqa_logits",
+    )
+    for path in candidates:
+        if importlib.util.find_spec(path) is None:
+            continue
         try:
-            module = importlib.import_module(paged_mqa_logits_module_path)
-            return module
+            module = importlib.import_module(path)
+            if getattr(module, "deepgemm_fp8_paged_mqa_logits", None) is not None:
+                return module
         except ImportError:
-            return None
+            continue
     return None
 
 
@@ -342,6 +370,17 @@ def rocm_fp8_paged_mqa_logits(
         use_new_api = (
             _deepgemm_fp8_paged_mqa_logits is not None and block_size > 1
         )
+        if not use_new_api:
+            logger.warning_once(
+                "ROCm sparse indexer decode: using deepgemm_fp8_paged_mqa_logits_stage1 "
+                "(block_size=%s, deepgemm_fp8_paged_mqa_logits available=%s). "
+                "Traces will not show the full fused Gluon paged kernel until "
+                "block_size>1 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS is effective "
+                "before aiter import.",
+                block_size,
+                _deepgemm_fp8_paged_mqa_logits is not None,
+                scope="local",
+            )
         if use_new_api:
             out_logits = torch.full(
                 (batch_size * next_n, max_model_len),
@@ -444,6 +483,10 @@ def rocm_fp8_mqa_logits(
 ) -> torch.Tensor:
     """Compute FP8 MQA logits for a single sequence without KV paging.
 
+    This is the **prefill** path (gathered contiguous K). It always calls
+    aiter's non-paged ``fp8_mqa_logits`` API. Profiler names like ``fp8_mqa_logits``
+    here are expected and unrelated to Gluon ``pa_mqa_logits`` / decode paging.
+
     Args:
         q: Query tensor of shape [M, H, D]. Casted to
             `torch.float8_e4m3fn` by caller.
@@ -466,21 +509,20 @@ def rocm_fp8_mqa_logits(
 
     @functools.lru_cache
     def mqa_logits_module():
-        mqa_logits_module_path = None
-        if importlib.util.find_spec("aiter.ops.triton.fp8_mqa_logits") is not None:
-            mqa_logits_module_path = "aiter.ops.triton.fp8_mqa_logits"
-        elif (
-            importlib.util.find_spec("aiter.ops.triton.attention.fp8_mqa_logits")
-            is not None
-        ):
-            mqa_logits_module_path = "aiter.ops.triton.attention.fp8_mqa_logits"
-
-        if mqa_logits_module_path is not None:
+        # Prefer attention.* (canonical) over legacy triton.fp8_mqa_logits shim.
+        candidates = (
+            "aiter.ops.triton.attention.fp8_mqa_logits",
+            "aiter.ops.triton.fp8_mqa_logits",
+        )
+        for path in candidates:
+            if importlib.util.find_spec(path) is None:
+                continue
             try:
-                module = importlib.import_module(mqa_logits_module_path)
-                return module
+                module = importlib.import_module(path)
+                if getattr(module, "fp8_mqa_logits", None) is not None:
+                    return module
             except ImportError:
-                return None
+                continue
         return None
 
     aiter_mqa_logits_module = None

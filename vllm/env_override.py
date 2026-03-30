@@ -5,6 +5,23 @@ import importlib.util
 import os
 
 
+def _maybe_set_aiter_gluon_pa_mqa_logits_env_early() -> None:
+    """Enable aiter Gluon for paged MQA logits before any aiter import.
+
+    ROCm aiter's `pa_mqa_logits` reads this at import time. If it is unset on
+    Triton < 3.5, Gluon is disabled and `deepgemm_fp8_paged_mqa_logits` may not
+    use the intended path. Use assignment (not setdefault) so we override an
+    incorrect value; respect explicit opt-out.
+    """
+    key = "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS"
+    if os.environ.get(key, "").strip().lower() in ("0", "false", "no"):
+        return
+    os.environ[key] = "1"
+
+
+_maybe_set_aiter_gluon_pa_mqa_logits_env_early()
+
+
 def _get_torch_cuda_version():
     """Peripheral function to _maybe_set_cuda_compatibility_path().
     PyTorch version must not be determined by importing directly
