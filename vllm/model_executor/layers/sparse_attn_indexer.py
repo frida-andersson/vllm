@@ -385,24 +385,18 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
-        if rocm_aiter_ops.is_enabled():
-            return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
-                hidden_states,
-                self.k_cache.prefix,
-                self.k_cache.kv_cache[0],
-                q_fp8,
-                k,
-                weights,
-                self.quant_block_size,
-                self.scale_fmt,
-                self.topk_tokens,
-                self.head_dim,
-                self.max_model_len,
-                self.max_total_seq_len,
-                self.topk_indices_buffer,
-            )
-        else:
-            raise RuntimeError(
-                "Sparse attention indexer ROCm custom op requires ROCm "
-                "Aiter ops to be enabled."
-            )
+        return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
+            hidden_states,
+            self.k_cache.prefix,
+            self.k_cache.kv_cache[0],
+            q_fp8,
+            k,
+            weights,
+            self.quant_block_size,
+            self.scale_fmt,
+            self.topk_tokens,
+            self.head_dim,
+            self.max_model_len,
+            self.max_total_seq_len,
+            self.topk_indices_buffer,
+        )

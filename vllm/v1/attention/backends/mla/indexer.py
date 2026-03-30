@@ -37,7 +37,11 @@ class DeepseekV32IndexerBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [1 if current_platform.is_rocm() else 64]
+        # ROCm must advertise 64 here (not 1): otherwise
+        # `select_common_block_size` picks 1 and the indexer KV cache uses
+        # block size 1 even when `--block-size 64`, breaking the gluon
+        # preshuffle path. CUDA has always used 64.
+        return [64]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
