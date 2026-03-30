@@ -1,8 +1,15 @@
 #ifndef CONCAT_MLA_Q_CUH_
 #define CONCAT_MLA_Q_CUH_
 
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+typedef __hip_bfloat162 __nv_bfloat162;
+typedef __hip_bfloat16 __nv_bfloat16;
+#endif
 
 #include "cuda_vec_utils.cuh"
 
