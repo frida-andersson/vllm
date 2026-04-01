@@ -91,6 +91,7 @@ def _rocm_aiter_fused_moe_impl(
     intermediate_pad: int = 0,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    moe_buf: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -118,6 +119,7 @@ def _rocm_aiter_fused_moe_impl(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        moe_buf=moe_buf,
     )
 
 
@@ -137,7 +139,14 @@ def _rocm_aiter_fused_moe_fake(
     a2_scale: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    moe_buf: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if moe_buf is not None:
+        return moe_buf
     if output_dtype is not None:
         return torch.empty_like(hidden_states, dtype=output_dtype)
     return torch.empty_like(hidden_states)
@@ -1528,6 +1537,7 @@ class rocm_aiter_ops:
         intermediate_pad: int = 0,
         bias1: torch.Tensor | None = None,
         bias2: torch.Tensor | None = None,
+        moe_buf: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
@@ -1549,6 +1559,7 @@ class rocm_aiter_ops:
             intermediate_pad,
             bias1,
             bias2,
+            moe_buf,
         )
 
     @staticmethod
