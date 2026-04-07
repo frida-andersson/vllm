@@ -6,10 +6,15 @@ import importlib
 import torch
 
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+
+logger = init_logger(__name__)
+
+_AITER_MQA_SMALL_HEADS_WARNED = False
 
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
@@ -325,14 +330,26 @@ def rocm_fp8_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    global _AITER_MQA_SMALL_HEADS_WARNED
     from vllm._aiter_ops import rocm_aiter_ops
 
+    batch_size, next_n, heads, _ = q_fp8.shape
+
+    # AITER's paged MQA logits kernel requires heads >= 16.
+    # Upstream tracker: https://github.com/ROCm/aiter/issues/2563
     aiter_paged_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
+    if rocm_aiter_ops.is_enabled() and heads >= 16:
         aiter_paged_mqa_logits_module = _paged_mqa_logits_module()
+    elif rocm_aiter_ops.is_enabled() and not _AITER_MQA_SMALL_HEADS_WARNED:
+        logger.warning(
+            "AITER paged MQA logits kernel does not support %d heads "
+            "(requires >= 16). Falling back to PyTorch reference. "
+            "See https://github.com/ROCm/aiter/issues/2563",
+            heads,
+        )
+        _AITER_MQA_SMALL_HEADS_WARNED = True
 
     if aiter_paged_mqa_logits_module is not None:
-        batch_size, next_n, heads, _ = q_fp8.shape
         _deepgemm_fp8_paged_mqa_logits = getattr(
             aiter_paged_mqa_logits_module,
             "deepgemm_fp8_paged_mqa_logits",
@@ -382,6 +399,7 @@ def rocm_fp8_paged_mqa_logits(
                 context_lens,
                 block_tables,
                 max_model_len,
+                ChunkQ=heads,
             )
             return out_qk.sum(dim=0)
     else:
@@ -483,8 +501,9 @@ def rocm_fp8_mqa_logits(
                 return None
         return None
 
+    heads = q.shape[1]
     aiter_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
+    if rocm_aiter_ops.is_enabled() and heads >= 16:
         aiter_mqa_logits_module = mqa_logits_module()
 
     if aiter_mqa_logits_module is not None:
@@ -574,50 +593,18 @@ def rocm_aiter_sparse_attn_indexer(
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
-        prefill_metadata = attn_metadata.prefill
-        for chunk in prefill_metadata.chunks:
-            k_fp8 = torch.empty(
-                [chunk.total_seq_lens, head_dim],
-                device=k.device,
-                dtype=fp8_dtype,
-            )
-            k_scale = torch.empty(
-                [chunk.total_seq_lens, 4],
-                device=k.device,
-                dtype=torch.uint8,
-            )
-
-            cp_gather_indexer_k_quant_cache_triton(
-                kv_cache,
-                k_fp8,
-                k_scale,
-                chunk.block_table,
-                chunk.cu_seq_lens,
-                chunk.token_to_seq,
-            )
-
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
-            num_rows = logits.shape[0]
-            assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+        # Phase 1: prefill tokens use forward_mha (flash_attn_varlen_func), not
+        # forward_mqa.  forward_mqa only reads topk_indices_buffer[0:num_decode_tokens],
+        # so topk indices for prefill positions are never consumed.
+        #
+        # The upstream rocm_aiter_sparse_attn_indexer would call
+        # cp_gather_indexer_k_quant_cache_triton (O(seq_len) allocation) and
+        # rocm_fp8_mqa_logits which allocates a [q_tokens, kv_tokens] float32
+        # logits tensor — O(n²) in sequence length, hitting 4 GiB OOM for
+        # requests with a large context (e.g. 7235 query tokens × 131072 KV
+        # tokens ≈ 3.8 GiB).  Skip both to avoid the allocation entirely.
+        # topk_indices_buffer for prefill positions stays -1 (set above).
+        pass
 
     if has_decode:
         decode_metadata = attn_metadata.decode
@@ -644,6 +631,15 @@ def rocm_aiter_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
+        # Use the actual max context length in this batch instead of
+        # max_model_len.  The logits tensor is [B*next_n, max_len] float32;
+        # with max_model_len=163840 and 64 seqs this is 40 MB of -inf that
+        # the top-k kernel never reads.  Using the tight bound shrinks the
+        # allocation to only what's needed.
+        # attn_metadata.max_seq_len is a CPU Python int computed before graph
+        # capture, so it is safe to use inside a cudagraph region (no D2H sync).
+        actual_max_seq_len = attn_metadata.max_seq_len
+
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -651,7 +647,7 @@ def rocm_aiter_sparse_attn_indexer(
             decode_metadata.seq_lens,
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
+            max_model_len=actual_max_seq_len,
             block_size=kv_block_size,
         )
 
