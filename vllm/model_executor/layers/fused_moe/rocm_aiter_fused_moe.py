@@ -405,4 +405,7 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             moe_buf=output,
         )
         if result is not output:
-            output.copy_(result)
+            if result.shape == output.shape and result.dtype == output.dtype:
+                output.data = result
+            else:
+                output.copy_(result)
