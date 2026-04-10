@@ -402,6 +402,9 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                     duplicated += 1
 
         if deduped > 0 or duplicated > 0:
+            from torch._inductor.pattern_matcher import stable_topological_sort
+
+            stable_topological_sort(graph)
             graph.lint()
         return deduped, duplicated
 
