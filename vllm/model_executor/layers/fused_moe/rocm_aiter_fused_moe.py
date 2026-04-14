@@ -27,6 +27,27 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 
+_bias_dtype_cache: dict[int, torch.Tensor] = {}
+
+
+def _get_bias_in_dtype(
+    bias: torch.Tensor, target_dtype: torch.dtype
+) -> torch.Tensor:
+    """Return *bias* cast to *target_dtype*, reusing a cached copy.
+
+    The e_score_correction_bias parameter is float32 but AITER's
+    biased_grouped_topk expects the gating-output dtype (bf16).
+    Converting on every MoE layer call adds 58 unnecessary kernel
+    launches per decode step.  Caching the result eliminates them.
+    """
+    key = id(bias)
+    cached = _bias_dtype_cache.get(key)
+    if cached is None or cached.dtype != target_dtype:
+        cached = bias.to(target_dtype)
+        _bias_dtype_cache[key] = cached
+    return cached
+
+
 class QuantMethod(IntEnum):
     # This allows interfacing with AITER QuantType Enum
     # without importing the QuantType from AITER globally.
@@ -148,9 +169,13 @@ def rocm_aiter_grouped_topk(
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
 
     if e_score_correction_bias is not None:
+        if e_score_correction_bias.dtype != gating_output.dtype:
+            e_score_correction_bias = _get_bias_in_dtype(
+                e_score_correction_bias, gating_output.dtype
+            )
         rocm_aiter_ops.biased_grouped_topk(
             gating_output,
-            e_score_correction_bias.to(gating_output.dtype),
+            e_score_correction_bias,
             topk_weights,
             topk_ids,
             num_expert_group,
@@ -405,7 +430,4 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             moe_buf=output,
         )
         if result is not output:
-            if result.shape == output.shape and result.dtype == output.dtype:
-                output.data = result
-            else:
-                output.copy_(result)
+            output.copy_(result)
