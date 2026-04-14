@@ -92,14 +92,14 @@ def _rocm_aiter_fused_moe_impl(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     moe_buf: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> None:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
 
     activation = ActivationType(activation_method)
     quant_type = QuantType(quant_method)
 
-    return fused_moe(
+    fused_moe(
         hidden_states,
         w1,
         w2,
@@ -144,12 +144,8 @@ def _rocm_aiter_fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     moe_buf: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if moe_buf is not None:
-        return moe_buf
-    if output_dtype is not None:
-        return torch.empty_like(hidden_states, dtype=output_dtype)
-    return torch.empty_like(hidden_states)
+) -> None:
+    pass
 
 
 def _rocm_aiter_asm_moe_tkw1_impl(
@@ -1247,7 +1243,7 @@ class rocm_aiter_ops:
             direct_register_custom_op(
                 op_name="rocm_aiter_fused_moe",
                 op_func=_rocm_aiter_fused_moe_impl,
-                mutates_args=[],
+                mutates_args=["moe_buf"],
                 fake_impl=_rocm_aiter_fused_moe_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
@@ -1539,7 +1535,14 @@ class rocm_aiter_ops:
         bias2: torch.Tensor | None = None,
         moe_buf: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_fused_moe(
+        if moe_buf is None:
+            M = topk_ids.shape[0]
+            model_dim = w2.shape[1]
+            dtype = output_dtype if output_dtype is not None else hidden_states.dtype
+            moe_buf = torch.empty(
+                (M, model_dim), dtype=dtype, device=hidden_states.device
+            )
+        torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
             w1,
             w2,
@@ -1561,6 +1564,7 @@ class rocm_aiter_ops:
             bias2,
             moe_buf,
         )
+        return moe_buf
 
     @staticmethod
     def asm_moe_tkw1(
