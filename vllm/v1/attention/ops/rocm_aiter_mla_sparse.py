@@ -16,6 +16,37 @@ logger = init_logger(__name__)
 
 _AITER_MQA_SMALL_HEADS_WARNED = False
 
+# Cached logits buffer for fp8_paged_mqa_logits.  Reused across layers
+# within a decode step (all 61 layers share the same batch dimensions)
+# to avoid a torch.full(-inf) allocation + fill per layer.
+_cached_paged_logits: torch.Tensor | None = None
+
+
+def _get_paged_logits_buffer(
+    rows: int, cols: int, device: torch.device
+) -> torch.Tensor:
+    """Return a (rows, cols) float32 buffer pre-filled with -inf.
+
+    Within a decode step every layer sees the same (batch*next_n,
+    actual_max_seq_len) shape, so the expensive torch.full call only
+    happens once per step (or when the shape changes).  The MQA logits
+    kernel overwrites positions 0..context_len-1 per row, and
+    top_k_per_row_decode respects seq_lens, so stale padding values
+    from a previous step are never read.
+    """
+    global _cached_paged_logits
+    if (
+        _cached_paged_logits is not None
+        and _cached_paged_logits.shape[0] == rows
+        and _cached_paged_logits.shape[1] == cols
+        and _cached_paged_logits.device == device
+    ):
+        return _cached_paged_logits
+    _cached_paged_logits = torch.full(
+        (rows, cols), float("-inf"), device=device, dtype=torch.float32
+    )
+    return _cached_paged_logits
+
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
 
@@ -360,11 +391,8 @@ def rocm_fp8_paged_mqa_logits(
             _deepgemm_fp8_paged_mqa_logits is not None and block_size > 1
         )
         if use_new_api:
-            out_logits = torch.full(
-                (batch_size * next_n, max_model_len),
-                float("-inf"),
-                device="cuda",
-                dtype=torch.float32,
+            out_logits = _get_paged_logits_buffer(
+                batch_size * next_n, max_model_len, q_fp8.device
             )
             _deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
@@ -388,7 +416,7 @@ def rocm_fp8_paged_mqa_logits(
             out_qk = torch.full(
                 (heads, batch_size * next_n, max_model_len),
                 float("-inf"),
-                device="cuda",
+                device=q_fp8.device,
                 dtype=torch.float32,
             )
             _stage1(
@@ -591,20 +619,13 @@ def rocm_aiter_sparse_attn_indexer(
         scale_fmt,
     )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
-        # Phase 1: prefill tokens use forward_mha (flash_attn_varlen_func), not
-        # forward_mqa.  forward_mqa only reads topk_indices_buffer[0:num_decode_tokens],
-        # so topk indices for prefill positions are never consumed.
-        #
-        # The upstream rocm_aiter_sparse_attn_indexer would call
-        # cp_gather_indexer_k_quant_cache_triton (O(seq_len) allocation) and
-        # rocm_fp8_mqa_logits which allocates a [q_tokens, kv_tokens] float32
-        # logits tensor — O(n²) in sequence length, hitting 4 GiB OOM for
-        # requests with a large context (e.g. 7235 query tokens × 131072 KV
-        # tokens ≈ 3.8 GiB).  Skip both to avoid the allocation entirely.
-        # topk_indices_buffer for prefill positions stays -1 (set above).
-        pass
+        # Prefill positions need -1 sentinels since the indexer skips prefill
+        # computation: forward_mqa only reads topk_indices_buffer[0:num_decode_tokens].
+        # In pure decode mode (steady-state generation), top_k_per_row_decode
+        # fully overwrites topk_indices_buffer[:num_decode_tokens, :topk_tokens],
+        # making this fill redundant — so we skip it to save ~4μs × 61 layers.
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
 
     if has_decode:
         decode_metadata = attn_metadata.decode
