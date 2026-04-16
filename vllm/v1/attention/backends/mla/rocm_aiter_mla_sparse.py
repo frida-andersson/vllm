@@ -208,6 +208,19 @@ class ROCMAiterMLASparseMetadataBuilder(
         # for the indexer's prefill logits allocation.
         self.paged_kv_indices = torch.zeros(1, dtype=torch.int32, device=device)
 
+        # The parent also allocates persistent MLA metadata buffers for
+        # aiter.get_mla_metadata_v1() (work_metadata, work_indptr,
+        # work_info_set, reduce_indptr, reduce_final_map, reduce_partial_map).
+        # Our _build_decode override never calls that function — release them.
+        # Largest is work_info_set at ~5 MB on MI355X (304 CUs × 512 reqs × 8).
+        _placeholder = torch.empty(0, dtype=torch.int32, device=device)
+        self.work_metadata = torch.empty(0, dtype=torch.uint64, device=device)
+        self.work_indptr = _placeholder
+        self.work_info_set = _placeholder
+        self.reduce_indptr = _placeholder
+        self.reduce_final_map = _placeholder
+        self.reduce_partial_map = _placeholder
+
         # Sparse-specific fields
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk

@@ -31,7 +31,7 @@ def _get_paged_logits_buffer(
     actual_max_seq_len) shape, so the expensive torch.full call only
     happens once per step (or when the shape changes).  The MQA logits
     kernel overwrites positions 0..context_len-1 per row, and
-    top_k_per_row_decode respects seq_lens, so stale padding values
+    large_context_topk respects seq_lens, so stale padding values
     from a previous step are never read.
     """
     global _cached_paged_logits
@@ -622,7 +622,7 @@ def rocm_aiter_sparse_attn_indexer(
     if has_prefill:
         # Prefill positions need -1 sentinels since the indexer skips prefill
         # computation: forward_mqa only reads topk_indices_buffer[0:num_decode_tokens].
-        # In pure decode mode (steady-state generation), top_k_per_row_decode
+        # In pure decode mode (steady-state generation), large_context_topk
         # fully overwrites topk_indices_buffer[:num_decode_tokens, :topk_tokens],
         # making this fill redundant — so we skip it to save ~4μs × 61 layers.
         topk_indices_buffer[: hidden_states.shape[0]] = -1
@@ -652,13 +652,12 @@ def rocm_aiter_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
-        # Use the actual max context length in this batch instead of
-        # max_model_len.  The logits tensor is [B*next_n, max_len] float32;
-        # with max_model_len=163840 and 64 seqs this is 40 MB of -inf that
-        # the top-k kernel never reads.  Using the tight bound shrinks the
-        # allocation to only what's needed.
-        # attn_metadata.max_seq_len is a CPU Python int computed before graph
-        # capture, so it is safe to use inside a cudagraph region (no D2H sync).
+        # NOTE: attn_metadata.max_seq_len is currently max_model_len (set
+        # in default.py), not the actual batch max.  The logits buffer is
+        # therefore [B*next_n, max_model_len] — larger than needed, but
+        # large_context_topk limits per-row work via seq_lens.  Tightening
+        # this to the real batch max would require a CUDA-graph-safe
+        # CPU-side max_seq_len in the metadata builder.
         actual_max_seq_len = attn_metadata.max_seq_len
 
         logits = rocm_fp8_paged_mqa_logits(
@@ -672,18 +671,27 @@ def rocm_aiter_sparse_attn_indexer(
             block_size=kv_block_size,
         )
 
-        num_rows = logits.shape[0]
-        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
+        assert topk_tokens == 2048, "large_context_topk assumes TopK == 2048"
         topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-        torch.ops._C.top_k_per_row_decode(
+
+        if next_n == 1:
+            lengths = decode_metadata.seq_lens
+        else:
+            offsets = torch.arange(
+                next_n, device=logits.device, dtype=torch.int32
+            )
+            lengths = (
+                decode_metadata.seq_lens.unsqueeze(1)
+                - next_n
+                + 1
+                + offsets
+            ).flatten()
+
+        torch.ops._C.large_context_topk(
             logits,
-            next_n,
-            decode_metadata.seq_lens,
             topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-            topk_tokens,
+            lengths,
+            None,
         )
 
         if decode_metadata.requires_padding:
