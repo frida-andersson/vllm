@@ -263,7 +263,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
         Uses ``get_ps_metadata_info_v1`` with max values so the buffers are
         large enough for any batch.  ``get_ps_metadata_v1`` fills them
-        per-batch in ``build()``.
+        per-batch in ``build()``.  The FP8 prefill forward path also uses the
+        global workspace manager for per-call scratch, so reserve its maximum
+        shape here before the workspace manager is locked after warmup.
 
         Args:
             max_num_reqs: Maximum number of concurrent requests.
@@ -279,6 +281,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # After kv_b_proj decompression, K has num_heads heads (same as Q).
         # So gqa_ratio=1 and num_head_k=num_heads for the PS kernel.
         num_head_k = self.num_heads
+        v_head_dim = self.mla_dims.v_head_dim
         # gqa_ratio = 1
         # qlen_granularity = _FP8_PREFILL_TILE_Q // max(gqa_ratio, 1)
         qlen_granularity = _FP8_PREFILL_TILE_Q
@@ -316,6 +319,25 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             reduce_partial_map_size,
             dtype=reduce_partial_map_dtype,
             device=device,
+        )
+
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        max_num_partial_tiles = (
+            reduce_partial_map_size
+            if isinstance(reduce_partial_map_size, int)
+            else int(torch.Size(reduce_partial_map_size).numel())
+        )
+        current_workspace_manager().get_simultaneous(
+            (
+                (max_num_partial_tiles * _FP8_PREFILL_TILE_Q, num_head_k, v_head_dim),
+                torch.float32,
+            ),
+            (
+                (max_num_partial_tiles * _FP8_PREFILL_TILE_Q, num_head_k),
+                torch.float32,
+            ),
+            ((max_prefill_qlen, num_head_k), torch.float32),
         )
 
         logger.info(
@@ -764,10 +786,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         # Per-call scratch (logits, attn_lse, final_lse) is served from the
         # workspace manager so allocator churn in the prefill hot path is
         # bounded after warmup, matching the pattern in PR #41002.
-        logits, attn_lse, final_lse = current_workspace_manager().get_simultaneous(
+        workspace_manager = current_workspace_manager()
+        scratch_shapes = (
             ((num_partial_tiles * tile_q, nhead, v_head_dim), torch.float32),
             ((num_partial_tiles * tile_q, nhead), torch.float32),
             ((total_q, nhead), torch.float32),
+        )
+        logits, attn_lse, final_lse = workspace_manager.get_simultaneous(
+            *scratch_shapes,
         )
 
         # Phase 1: persistent-scheduling assembly prefill kernel.
