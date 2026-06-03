@@ -29,6 +29,11 @@ else:
 _FUSED_INDEXER_Q_FP8_BUF: torch.Tensor | None = None
 _FUSED_INDEXER_WEIGHTS_OUT_BUF: torch.Tensor | None = None
 
+# Persistent workspace for ``rocm_fp8_paged_mqa_logits``'s ``out_logits``.
+# Downstream topk reads ``row[i, :seq_lens[i]]`` only, so per-call
+# ``torch.full(..., -inf)`` was a pure launch + bandwidth tax.
+_PAGED_MQA_LOGITS_BUF: torch.Tensor | None = None
+
 
 def _get_fused_indexer_workspace(
     num_tokens: int,
@@ -64,6 +69,35 @@ def _get_fused_indexer_workspace(
     weights_buf = _FUSED_INDEXER_WEIGHTS_OUT_BUF
     assert q_fp8_buf is not None and weights_buf is not None
     return q_fp8_buf[:num_tokens], weights_buf[:num_tokens]
+
+
+def _get_paged_mqa_logits_workspace(
+    num_rows: int,
+    max_model_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Grows monotonically; rows rounded up to next power of two for
+    cudagraph-stable address. ``-inf`` filled once on (re)allocation."""
+    global _PAGED_MQA_LOGITS_BUF
+    cur = _PAGED_MQA_LOGITS_BUF
+    need_realloc = (
+        cur is None
+        or cur.size(0) < num_rows
+        or cur.size(1) < max_model_len
+        or cur.device != device
+    )
+    if need_realloc:
+        cur_rows = cur.size(0) if cur is not None else 0
+        new_rows = max(16, 1 << max(0, num_rows - 1).bit_length(), cur_rows)
+        _PAGED_MQA_LOGITS_BUF = torch.full(
+            (new_rows, max_model_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+    buf = _PAGED_MQA_LOGITS_BUF
+    assert buf is not None
+    return buf[:num_rows, :max_model_len]
 
 
 @triton.jit
@@ -461,11 +495,8 @@ def rocm_fp8_paged_mqa_logits(
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
             batch_size, next_n, heads, _ = q_fp8.shape
-            out_logits = torch.full(
-                [batch_size * next_n, max_model_len],
-                float("-inf"),
-                device="cuda",
-                dtype=torch.float32,
+            out_logits = _get_paged_mqa_logits_workspace(
+                batch_size * next_n, max_model_len, q_fp8.device
             )
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
