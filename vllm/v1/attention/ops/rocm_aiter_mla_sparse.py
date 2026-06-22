@@ -578,6 +578,17 @@ def rocm_fp8_mqa_logits(
     # Remove this branch once vLLM bumps AITER to a version that includes
     # ROCm/aiter#3257.
     if _ON_GFX942 and rocm_aiter_ops.is_enabled():
+        # Quick fix for the upstream prefill regression: the vendored gfx942
+        # "aiter#3257 workaround" kernel is ~2x slower per call than aiter's
+        # fp8_mqa_logits. Our pinned AITER already includes #3257, so prefer
+        # aiter's kernel here and only fall back to the vendored copy if the
+        # aiter module is unavailable.
+        aiter_mqa_module = mqa_logits_module()
+        if aiter_mqa_module is not None:
+            return aiter_mqa_module.fp8_mqa_logits(
+                q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
+            )
+
         from vllm.v1.attention.ops.triton_fp8_mqa_logits import (
             fp8_mqa_logits_gfx942,
         )
