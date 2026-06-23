@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -368,6 +369,24 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+
+        # Cap the KV-split count for the sparse MLA decode attention kernel.
+        # The decode reduces over only `topk_tokens` (<=2048) selected entries,
+        # but aiter's metadata defaults `max_split_per_batch=-1`, which makes
+        # num_splits=num_cu (304 on MI325X) -> ~7 tokens/split -> over-fragmented
+        # reduction. A microbench sweep at ISL 130k shows the optimum is ~16
+        # splits (28.8us vs 40.7us at 304). This is independent of the indexer
+        # CU-count fix (ROCm/aiter#3760), which scales over the full context.
+        # -1 keeps the current (num_cu) behavior.
+        self._mla_max_split_per_batch = int(
+            os.environ.get("VLLM_ROCM_MLA_SPARSE_MAX_SPLIT", "-1")
+        )
+        if self._mla_max_split_per_batch > 0:
+            logger.info_once(
+                "ROCm sparse MLA decode: capping max_split_per_batch=%d "
+                "(VLLM_ROCM_MLA_SPARSE_MAX_SPLIT)",
+                self._mla_max_split_per_batch,
+            )
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -438,6 +457,13 @@ class ROCMAiterMLASparseMetadataBuilder(
             is_sparse=True,
             fast_mode=True,
         )
+        # NOTE: intentionally NOT forwarding max_split_per_batch here.
+        # Capping splits only ever produces *fewer* partial tiles than the
+        # default (-1 => num_cu) path these buffers were already proven to
+        # hold, so the existing fast-mode sizing is sufficient. Passing the cap
+        # here would instead enlarge reduce_partial_map to tile_cnt*num_cu
+        # (attention.py:1159-1161, batch padded to max_num_batched_tokens),
+        # a ~20MB over-allocation for no benefit.
         self._mla_work_meta_data = torch.empty(
             work_meta_data_size, dtype=work_meta_data_type, device=device
         )
@@ -557,6 +583,7 @@ class ROCMAiterMLASparseMetadataBuilder(
                 max_seqlen_qo=1,
                 uni_seqlen_qo=1,
                 fast_mode=True,
+                max_split_per_batch=self._mla_max_split_per_batch,
             )
             self._prev_metadata_key = metadata_key
 

@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -23,6 +24,68 @@ if current_platform.is_rocm():
 else:
     _ON_GFX942 = False
     _ON_GFX950 = False
+
+
+# EXPERIMENT (uplift item 2): route the sparse-indexer decode top-k through
+# AITER instead of vLLM's built-in torch.ops._C.top_k_per_row_decode.
+#   "0" (default) -> torch.ops._C.top_k_per_row_decode (current behavior)
+#   "1"           -> aiter.ops.topk.top_k_per_row_decode (HIP radix)
+#   "2"           -> aiter.ops.topk.top_k_per_row_decode_fast (gfx942 ASM .co,
+#                    k==2048 only; falls back to the HIP path otherwise)
+_USE_AITER_TOPK_DECODE = os.environ.get("VLLM_ROCM_USE_AITER_TOPK_DECODE", "0")
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_topk_decode_ops():
+    from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_decode_fast
+
+    return top_k_per_row_decode, top_k_per_row_decode_fast
+
+
+def _run_top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    topk_indices: torch.Tensor,
+    num_rows: int,
+    topk_tokens: int,
+) -> None:
+    # AITER's C++ entry declares stride1 but ignores it, so both AITER paths
+    # require a contiguous last dim. Fall back to _C otherwise.
+    if _USE_AITER_TOPK_DECODE != "0" and logits.stride(1) == 1:
+        hip_decode, asm_decode = _aiter_topk_decode_ops()
+        if _USE_AITER_TOPK_DECODE == "2" and _ON_GFX942 and topk_tokens == 2048:
+            asm_decode(
+                logits,
+                next_n,
+                seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+            )
+            return
+        hip_decode(
+            logits,
+            next_n,
+            seq_lens,
+            topk_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk_tokens,
+        )
+        return
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        topk_indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
 
 
 @triton.jit
@@ -425,11 +488,14 @@ def rocm_fp8_paged_mqa_logits(
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
             batch_size, next_n, heads, _ = q_fp8.shape
-            # torch.full avoids workspace: workspace offset-0 aliases q_fp8,
-            # so a workspace-backed fill_(-inf) would corrupt q_fp8.
-            out_logits = torch.full(
+            # No -inf prefill needed: deepgemm_fp8_paged_mqa_logits writes
+            # every position in [0, seq_len) for each row, and the downstream
+            # topKPerRowDecode bounds its scan to rowEnd == seq_len (see
+            # csrc/libtorch_stable/sampler.cu), so the [seq_len:] tail is never
+            # read. We only need the allocation. torch.empty (not the workspace,
+            # whose offset-0 aliases q_fp8) avoids the per-call fill memset.
+            out_logits = torch.empty(
                 (batch_size * next_n, max_model_len),
-                float("-inf"),
                 device=q_fp8.device,
                 dtype=torch.float32,
             )
@@ -944,14 +1010,12 @@ def rocm_aiter_sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
-        torch.ops._C.top_k_per_row_decode(
+        _run_top_k_per_row_decode(
             logits,
             next_n,
             decode_metadata.seq_lens,
             topk_indices,
             num_rows,
-            logits.stride(0),
-            logits.stride(1),
             topk_tokens,
         )
 
