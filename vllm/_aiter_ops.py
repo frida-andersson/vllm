@@ -446,6 +446,30 @@ def _rocm_aiter_fused_topk_fake(
 # Cache whether aiter supports FP8 MLA parameters
 _AITER_MLA_SUPPORTS_FP8: bool | None = None
 _AITER_HAS_FUSED_QK_RMSNORM: bool | None = None
+_AITER_HAS_FUSED_QK_RMSNORM_GROUP_QUANT: bool | None = None
+
+
+def check_aiter_fused_qk_rmsnorm_group_quant() -> bool:
+    """Check if aiter provides fused_qk_rmsnorm_group_quant.
+
+    This is the fused RMSNorm + FP8 *group* (block-scale) quant HIP kernel used
+    to fuse the paired q/kv RMSNorm + FP8 group quantization in the MLA FP8
+    attention path (DeepSeek-V3.2 block-scale q_b_proj).
+
+    TODO: remove this guard once the minimum supported AITER version provides
+    fused_qk_rmsnorm_group_quant, as with check_aiter_fused_qk_rmsnorm below.
+    """
+    global _AITER_HAS_FUSED_QK_RMSNORM_GROUP_QUANT
+    if _AITER_HAS_FUSED_QK_RMSNORM_GROUP_QUANT is None:
+        try:
+            from aiter.ops.fused_qk_rmsnorm_group_quant import (  # noqa: F401
+                fused_qk_rmsnorm_group_quant,
+            )
+
+            _AITER_HAS_FUSED_QK_RMSNORM_GROUP_QUANT = True
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            _AITER_HAS_FUSED_QK_RMSNORM_GROUP_QUANT = False
+    return _AITER_HAS_FUSED_QK_RMSNORM_GROUP_QUANT
 
 
 def check_aiter_fused_qk_rmsnorm() -> bool:
@@ -1352,6 +1376,79 @@ def _fused_mla_dual_rms_norm_fake(
     return (torch.empty_like(x1), torch.empty_like(x2))
 
 
+def _fused_mla_dual_rms_norm_group_quant_impl(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    q_epsilon: float,
+    kv_epsilon: float,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused MLA q/kv RMSNorm (+ FP8 *group* quant on q) via AITER.
+
+    Backs the ``fused_mla_dual_rms_norm_group_quant`` custom op used by the MLA
+    FP8 attention fusion when the q latent is quantized with block (group)
+    scales (DeepSeek-V3.2 ``q_b_proj``). Only the *q* latent is FP8 quantized
+    (it feeds the FP8 ``q_b_proj`` GEMM and the indexer ``wq_b`` GEMM); the *kv*
+    latent is RMS-normed and consumed by attention as bf16.
+
+    The q scale is emitted in the same ``(M, ceil(N/group_size))`` non-transposed
+    layout as the standalone ``rocm_aiter_rmsnorm_fp8_group_quant`` op, so the
+    fused kernel is a drop-in for the unfused q group-quant + kv rms_norm pair.
+    """
+    try:
+        from aiter.ops.fused_qk_rmsnorm_group_quant import (
+            fused_qk_rmsnorm_group_quant,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ImportError(
+            "fused_qk_rmsnorm_group_quant requires a newer AITer version. "
+            "Please upgrade aiter or disable the fuse_mla_dual_rms_norm pass."
+        ) from exc
+
+    mq, nq = q.shape
+    n_groups = (nq + group_size - 1) // group_size
+    q_out = torch.empty((mq, nq), dtype=FP8_DTYPE, device=q.device)
+    q_scale = torch.empty((mq, n_groups), dtype=torch.float32, device=q.device)
+    kv_normed = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
+
+    # q -> RMSNorm + FP8 group quant (q slot); kv -> RMSNorm only (k slot).
+    # `split` views are accepted directly; the kernel handles strided inputs.
+    fused_qk_rmsnorm_group_quant(
+        q_out_quantized=q_out,
+        q_out_scale=q_scale,
+        q=q,
+        q_weight=q_weight,
+        q_epsilon=q_epsilon,
+        k_out=kv_normed,
+        k=kv,
+        k_weight=kv_weight,
+        k_epsilon=kv_epsilon,
+        group_size=group_size,
+        transpose_scale=False,
+        gemma_norm=False,
+    )
+    return q_out, q_scale, kv_normed
+
+
+def _fused_mla_dual_rms_norm_group_quant_fake(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    q_epsilon: float,
+    kv_epsilon: float,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mq, nq = q.shape
+    n_groups = (nq + group_size - 1) // group_size
+    q_out = torch.empty((mq, nq), dtype=FP8_DTYPE, device=q.device)
+    q_scale = torch.empty((mq, n_groups), dtype=torch.float32, device=q.device)
+    kv_normed = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
+    return q_out, q_scale, kv_normed
+
+
 def _rocm_aiter_gemm_a8wfp4_impl(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -2066,6 +2163,13 @@ class rocm_aiter_ops:
                 fake_impl=_fused_mla_dual_rms_norm_fake,
             )
 
+            direct_register_custom_op(
+                op_name="fused_mla_dual_rms_norm_group_quant",
+                op_func=_fused_mla_dual_rms_norm_group_quant_impl,
+                mutates_args=[],
+                fake_impl=_fused_mla_dual_rms_norm_group_quant_fake,
+            )
+
             _OPS_REGISTERED = True
 
     @staticmethod
@@ -2139,6 +2243,10 @@ class rocm_aiter_ops:
     @staticmethod
     def get_fused_mla_dual_rms_norm_op() -> OpOverload:
         return torch.ops.vllm.fused_mla_dual_rms_norm.default
+
+    @staticmethod
+    def get_fused_mla_dual_rms_norm_group_quant_op() -> OpOverload:
+        return torch.ops.vllm.fused_mla_dual_rms_norm_group_quant.default
 
     @staticmethod
     def w8a8_gemm(
