@@ -35,6 +35,24 @@ else:
 _USE_AITER_TOPK_DECODE = os.environ.get("VLLM_ROCM_USE_AITER_TOPK_DECODE", "0")
 
 
+# EXPERIMENT (prefill TTFT): select the gfx942 sparse-indexer prefill scorer
+# (fp8_mqa_logits) backend. Lets us A/B the prefill scorer without rebuilding.
+#   "aiter"  (default) -> aiter.ops.triton.fp8_mqa_logits.fp8_mqa_logits
+#                         (falls back to the vendored Triton copy if missing)
+#   "triton"           -> vendored vLLM gfx942 Triton copy (aiter#3257 workaround)
+#   "flydsl"           -> FlyDSL MFMA kernel (fp8_mqa_logits_flydsl)
+_PREFILL_MQA_BACKEND = os.environ.get(
+    "VLLM_ROCM_DSV32_PREFILL_MQA_BACKEND", "aiter"
+).lower()
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_mqa_logits_fn():
+    from vllm.v1.attention.ops.fp8_mqa_logits_flydsl import flydsl_fp8_mqa_logits
+
+    return flydsl_fp8_mqa_logits
+
+
 @functools.lru_cache(maxsize=1)
 def _aiter_topk_decode_ops():
     from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_decode_fast
@@ -644,16 +662,22 @@ def rocm_fp8_mqa_logits(
     # Remove this branch once vLLM bumps AITER to a version that includes
     # ROCm/aiter#3257.
     if _ON_GFX942 and rocm_aiter_ops.is_enabled():
-        # Quick fix for the upstream prefill regression: the vendored gfx942
-        # "aiter#3257 workaround" kernel is ~2x slower per call than aiter's
-        # fp8_mqa_logits. Our pinned AITER already includes #3257, so prefer
-        # aiter's kernel here and only fall back to the vendored copy if the
-        # aiter module is unavailable.
-        aiter_mqa_module = mqa_logits_module()
-        if aiter_mqa_module is not None:
-            return aiter_mqa_module.fp8_mqa_logits(
+        # Prefill-scorer backend is selectable for A/B (_PREFILL_MQA_BACKEND).
+        # Default "aiter": the vendored gfx942 "aiter#3257 workaround" Triton
+        # kernel is ~2x slower per call than aiter's fp8_mqa_logits, and our
+        # pinned AITER already includes #3257. "flydsl" routes to the FlyDSL
+        # MFMA kernel; "triton" forces the vendored copy.
+        if _PREFILL_MQA_BACKEND == "flydsl":
+            return _flydsl_mqa_logits_fn()(
                 q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
             )
+
+        if _PREFILL_MQA_BACKEND != "triton":
+            aiter_mqa_module = mqa_logits_module()
+            if aiter_mqa_module is not None:
+                return aiter_mqa_module.fp8_mqa_logits(
+                    q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
+                )
 
         from vllm.v1.attention.ops.triton_fp8_mqa_logits import (
             fp8_mqa_logits_gfx942,
