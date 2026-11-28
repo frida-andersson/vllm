@@ -983,7 +983,7 @@ def test_rocm_attention_takes_the_gfx942_indexer_with_the_flag(
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm attention")
-@pytest.mark.parametrize("cdna_version", [3, 4, 5])
+@pytest.mark.parametrize("cdna_version", [3, 4])
 def test_rocm_attention_wo_a_with_online_quant(
     default_vllm_config, dist_init, monkeypatch, cdna_version
 ):

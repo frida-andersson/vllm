@@ -692,13 +692,10 @@ class DeepseekV41ROCMAiterSparseSWABackend(DeepseekSparseSWABackend):
 def _refuse_requantized_wo_a(wo_a: torch.nn.Module) -> None:
     # Only CDNA3 keeps wo_a on the checkpoint's method; the other wo_a paths
     # read its MXFP8 block scales.
-    from vllm.platforms.rocm import get_cdna_version
-
-    if get_cdna_version() != 3 and getattr(
-        wo_a.quant_method, "requantization_source", None
-    ):
+    if getattr(wo_a.quant_method, "requantization_source", None):
         raise ValueError(
-            f"Online quantization of {wo_a.prefix} is only supported on CDNA3"
+            f"Online quantization of {wo_a.prefix} is only supported on CDNA3. "
+            "Drop --quantization-config, or add '*.wo_a' to its 'ignore' list."
         )
 
 
